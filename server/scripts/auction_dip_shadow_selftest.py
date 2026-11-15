@@ -277,7 +277,7 @@ ck(ev1['ready'] is True and ev1['pass'] is False and ev1['checks']['t_ok'] is Fa
 ck(ev1['deep_dip']['excess_mean_pp'] is not None
    and near(ev1['deep_dip']['excess_mean_pp'],
             (1 / 0.95 - 1) * 100 - bench_i, 0.001)
-   and ev1['feeModel'] == '策略与基准均扣双边0.202%比例近似费用',
+   and ev1['feeModel'] == '策略与基准均扣双边0.152%比例近似费用',
    f'策略与基准同扣双边费用后超额仍等于毛超额、费用不造成偏差，实得 {ev1["deep_dip"]}')
 cs = ads.cluster_stats([0.5, 1.5, 1.0])
 ck(cs['days'] == 3 and near(cs['mean'], 1.0, 1e-3) and near(cs['t'], 3.46, 0.01)
