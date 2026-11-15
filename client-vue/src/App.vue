@@ -38,6 +38,8 @@
             </button>
           </div>
         </nav>
+        <!-- 静态引入（非懒加载）：页面卡顿时首屏就能点，不必等设置页 chunk -->
+        <RestartButton />
       </header>
       <!-- 本次加载耗时（2026-10-30）：一行细条，切页后自动重新计时，点开看逐接口明细 -->
       <LoadTiming />
@@ -215,6 +217,7 @@
   import LoginPage from './components/LoginPage.vue'
   import IndexBar from './components/IndexBar.vue'
   import LoadTiming from './components/LoadTiming.vue'
+  import RestartButton from './components/RestartButton.vue'
   import { startPage } from './utils/perf'
 
   // 2026-08-31 性能优化：非默认 Tab 与弹窗改为动态导入（配合懒挂载）。
