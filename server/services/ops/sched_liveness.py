@@ -287,8 +287,8 @@ def _render_blind(err: str, day: str, now: datetime) -> str:
 
 def _send(text: str) -> bool:
     try:
-        from services.support.push import push_wecom_webhook
-        return bool(push_wecom_webhook(text))
+        from services.ops.alert_throttle import push_non_stock_alert
+        return push_non_stock_alert(text, source='sched_liveness')
     except Exception as e:
         print(f'[调度失活] 推送失败（下次重试，不写去重标记）: {e}')
         return False

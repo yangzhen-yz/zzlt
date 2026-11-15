@@ -152,8 +152,8 @@ def check_and_alert(force: bool = False) -> Dict[str, Any]:
                   _recent_task_anchor()))
     pushed = False
     try:
-        from services.support.push import push_wecom_webhook
-        pushed = bool(push_wecom_webhook(content))
+        from services.ops.alert_throttle import push_non_stock_alert
+        pushed = push_non_stock_alert(content, source='db_lock_sentinel')
     except Exception as e:
         print(f'[写锁哨兵] 推送失败: {e}')
     _last_alert_ts = time.time()
