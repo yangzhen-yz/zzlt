@@ -130,3 +130,66 @@ async def api_usage_set_limit_api(body: Dict, user: Dict = Depends(current_user)
     print(f"[接口用量] {user.get('username') or user.get('id')} 改了 {key} 上限 = {limit}")
     return {"success": True, "data": {"key": key, "limit": limit}}
 
+
+@router.get("/api/system/restart-status", tags=["运维"])
+async def restart_status_api(user: Dict = Depends(current_user)):
+    """页面「重启服务」按钮的只读状态：有没有待处理请求、会不会盘中推迟、进程 bootId。
+
+    bootId 每次后端进程启动都会变，前端提交重启前记下旧值，之后轮询本接口，
+    值一变就说明看护已经把新进程拉起来了（不要靠「请求成功」判断，重启中间会断连）。
+    """
+    from services.ops import restart_request as R
+    from services.support import app_settings as A
+    data = R.status()
+    data['canRestart'] = A.can_write(user)
+    return {"success": True, "data": data}
+
+
+@router.post("/api/system/restart", tags=["运维"])
+async def restart_request_api(reason: str = '', user: Dict = Depends(current_user)):
+    """提交一次后端重启请求（管理员，幂等）。**只写标志，不杀进程**。
+
+    后端是 SYSTEM 账户由 GupiaoBackendWatchdog 计划任务拉起的，Web 进程没权限杀它；
+    而且绕过看护直接杀会丢掉「拉起→删标志→清僵尸→企微通知」这一串动作。
+    这里写 server/data/backend_restart_requested，看护每 5 分钟一轮读到就重启；
+    工作日 09:10～15:10 会保留标志、推迟到 15:10 之后（避免打断推荐批次）。
+    标志已存在（别人提交的 / HTTP 自愈写的）时不覆盖，直接返回已有状态。
+
+    注意：若服务已经卡到 HTTP 完全不应答，这个接口同样发不进来——那种情况由
+    http_liveness 连续 3 次探活失败自动写标志 + 看护接管，前端会如实提示。
+    """
+    from services.ops import restart_request as R
+    from services.support import app_settings as A
+    if not A.can_write(user):
+        raise HTTPException(status_code=403, detail='只有管理员账号能重启服务（默认仅最早注册的账号）')
+    actor = str(user.get('username') or user.get('id') or 'unknown')
+    res = R.request(actor=actor, reason=reason[:120])
+    if res.get('error'):
+        raise HTTPException(status_code=500, detail=res['error'])
+    print(f"[人工重启] {actor} 提交重启请求 queued={res.get('queued')} "
+          f"already={res.get('already')} deferred={res.get('deferred')} reason={reason[:60]}")
+    return {"success": True, "data": res}
+
+
+@router.get("/api/system/closed-cache", tags=["运维"])
+async def closed_cache_stats_api(user: Dict = Depends(current_user)):
+    """休市静态窗口整包缓存的排障视图：窗口、TTL、条目数、命中/未命中/写入计数。
+
+    排障顺序：先看 staticWindow（盘中应为 False）、再看 hits/stores 是否增长、
+    最后看响应头 X-Closed-Cache: hit。缓存不热时务必区分「盘中旁路」与
+    「白名单没覆盖」，别急着改 TTL。
+    """
+    from services.support import closed_response_cache as C
+    return {"success": True, "data": C.stats()}
+
+
+@router.post("/api/system/closed-cache/invalidate", tags=["运维"])
+async def closed_cache_invalidate_api(user: Dict = Depends(current_user)):
+    """手动清空休市响应缓存（改了口径/落库后想立刻看新数据时用）。
+
+    清空只影响「静态窗口内的缓存」，盘中本来就不读缓存；不碰数据库、不重启进程。
+    """
+    from services.support import closed_response_cache as C
+    C.invalidate()
+    return {"success": True, "data": C.stats()}
+

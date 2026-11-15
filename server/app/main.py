@@ -207,9 +207,37 @@ async def lifespan(app: FastAPI):
             _last_scan_ts = time.time()
             print(f'[初始化] 预加载趋势数据完成: {_last_scan_date}, {len(cached.get("stocks", []))}只股票')
             today = date.today().isoformat()
-            if _last_scan_date != today:
-                print(f'[初始化] 趋势数据过期({_last_scan_date})，后台开始扫描...')
-                asyncio.create_task(scan_trend_task(force=True))
+            # 2026-11-15：非交易日/盘前不 force 全量趋势扫描。原来只看
+            # 「落库日期 != 今天」就跑，周日缓存是周五的 → 每次周末重启都白付
+            # 一次 172.9s 全量扫描，且正好压在 uvicorn 事件循环上（所有请求排队）。
+            # 休市日行情不变，直接复用上一交易日已落库的结果即可。
+            try:
+                from app.config import SCHEDULE_TREND_SCAN_START as _scan_start
+            except Exception:
+                _scan_start = '09:00'
+            _hhmm = datetime.now().strftime('%H:%M')
+            if (_last_scan_date != today and is_trading_day(today)
+                    and _hhmm >= _scan_start):
+                # 2026-11-15 GIL 根治：全市场扫描（线上 172.9s）原来用
+                # `asyncio.create_task` 挂在 uvicorn 主事件循环上，启动后
+                # 那段时间内所有 HTTP 请求排队。改派独立短命子进程。
+                _sent = False
+                try:
+                    from core import heavy_runner
+                    _sent = (heavy_runner.enabled()
+                             and heavy_runner.submit('job_scan_trend', 'job'))
+                except Exception as _iso_err:
+                    print(f'[初始化] 趋势扫描派发失败，退回事件循环内执行: {_iso_err}')
+                if _sent:
+                    print(f'[初始化] 趋势数据过期({_last_scan_date})，'
+                          f'全量扫描已派发到独立进程（不占用事件循环）')
+                else:
+                    print(f'[初始化] 趋势数据过期({_last_scan_date})，'
+                          f'后台开始扫描（重活隔离关闭，回滚路径）...')
+                    asyncio.create_task(scan_trend_task(force=True))
+            elif _last_scan_date != today:
+                print(f'[初始化] 趋势数据为上一交易日({_last_scan_date})；'
+                      f'非交易日/盘前不触发全量扫描，直接复用落库结果')
     except Exception as error:
         print(f'[初始化] 预加载趋势数据失败: {str(error)}')
     # 启动时收评补生成：交易日 15:10 后若今日收评缺失，后台自动补生成
@@ -220,25 +248,40 @@ async def lifespan(app: FastAPI):
             _existing_reviews = load_daily_market_reviews()
             _has_today_review = any(r.get('date') == _today_str for r in (_existing_reviews or [])[:3])
             if not _has_today_review:
-                print(f'[初始化] 今日({_today_str})收评缺失，后台补生成中...')
-                from services.ops.review import generate_daily_review
-                from db.database import save_daily_market_reviews
-                async def _startup_review():
-                    try:
-                        _review = await generate_daily_review()
-                        save_daily_market_reviews([_review])
-                        # 2026-11-04 复查补：收评共 3 个写入点（API / 定时任务 / 这里），
-                        # 前两个都已失效缓存，启动时补生成漏了 —— 若预热先建了缓存，
-                        # 新收评要等 5 分钟 TTL + 一轮后台刷新才可见。
+                # 2026-11-15：收评补生成（AI + 全市场行情）原来挂在 uvicorn
+                # 主 loop 上；改派独立进程，主进程不占 GIL。派发失败/开关关闭
+                # 时仍走原来的 create_task，行为一字不变。
+                _sent = False
+                try:
+                    from core import heavy_runner
+                    _sent = (heavy_runner.enabled()
+                             and heavy_runner.submit('job_generate_review', 'job'))
+                except Exception as _iso_err:
+                    print(f'[初始化] 收评补生成派发失败，退回事件循环: {_iso_err}')
+                if _sent:
+                    print(f'[初始化] 今日({_today_str})收评缺失，补生成已派发到独立进程')
+                else:
+                    print(f'[初始化] 今日({_today_str})收评缺失，后台补生成中...')
+                if not _sent:
+                    from services.ops.review import generate_daily_review
+                    from db.database import save_daily_market_reviews
+
+                    async def _startup_review():
                         try:
-                            from app.api.routes import _invalidate_daily_reviews_cache
-                            _invalidate_daily_reviews_cache()
-                        except Exception as _ie:
-                            print(f'[初始化] 收评缓存失效失败（不影响补生成）: {_ie}')
-                        print(f'[初始化] 收评补生成完成，情绪分={_review.get("aiAnalysis",{}).get("sentimentScore","N/A")}')
-                    except Exception as _e:
-                        print(f'[初始化] 收评补生成失败: {_e}')
-                asyncio.create_task(_startup_review())
+                            _review = await generate_daily_review()
+                            save_daily_market_reviews([_review])
+                            # 2026-11-04 复查补：收评共 3 个写入点（API / 定时任务 / 这里），
+                            # 前两个都已失效缓存，启动时补生成漏了 —— 若预热先建了缓存，
+                            # 新收评要等 5 分钟 TTL + 一轮后台刷新才可见。
+                            try:
+                                from app.api.routes import _invalidate_daily_reviews_cache
+                                _invalidate_daily_reviews_cache()
+                            except Exception as _ie:
+                                print(f'[初始化] 收评缓存失效失败（不影响补生成）: {_ie}')
+                            print(f'[初始化] 收评补生成完成，情绪分={_review.get("aiAnalysis",{}).get("sentimentScore","N/A")}')
+                        except Exception as _e:
+                            print(f'[初始化] 收评补生成失败: {_e}')
+                    asyncio.create_task(_startup_review())
     except Exception as error:
         print(f'[初始化] 收评补生成检查失败: {str(error)}')
     # 启动时回测补执行：交易日 15:20 后若最近交易日回测报告缺失，后台自动补跑
@@ -263,18 +306,31 @@ async def lifespan(app: FastAPI):
             ).fetchone()
             _conn.close()
             if not _row:
-                print(f'[初始化] 最近交易日({_latest_str})回测报告缺失，后台补跑中...')
-                from services.strategy.strategy import backtest_yesterday_predictions
-                async def _startup_backtest():
-                    try:
-                        _r = await backtest_yesterday_predictions()
-                        if 'error' in _r:
-                            print(f'[初始化] 回测补跑失败: {_r["error"]}')
-                        else:
-                            print(f'[初始化] 回测补跑完成: 准确率{_r.get("accuracy", 0)}%')
-                    except Exception as _e:
-                        print(f'[初始化] 回测补跑失败: {_e}')
-                asyncio.create_task(_startup_backtest())
+                # 2026-11-15：回测补跑同样是 CPU 重活，改派独立进程。
+                _sent_bt = False
+                try:
+                    from core import heavy_runner
+                    _sent_bt = (heavy_runner.enabled()
+                                and heavy_runner.submit('job_backtest', 'job'))
+                except Exception as _iso_err:
+                    print(f'[初始化] 回测补跑派发失败，退回事件循环: {_iso_err}')
+                if _sent_bt:
+                    print(f'[初始化] 最近交易日({_latest_str})回测报告缺失，补跑已派发到独立进程')
+                else:
+                    print(f'[初始化] 最近交易日({_latest_str})回测报告缺失，后台补跑中...')
+                if not _sent_bt:
+                    from services.strategy.strategy import backtest_yesterday_predictions
+
+                    async def _startup_backtest():
+                        try:
+                            _r = await backtest_yesterday_predictions()
+                            if 'error' in _r:
+                                print(f'[初始化] 回测补跑失败: {_r["error"]}')
+                            else:
+                                print(f'[初始化] 回测补跑完成: 准确率{_r.get("accuracy", 0)}%')
+                        except Exception as _e:
+                            print(f'[初始化] 回测补跑失败: {_e}')
+                    asyncio.create_task(_startup_backtest())
     except Exception as error:
         print(f'[初始化] 回测补跑检查失败: {str(error)}')
     # -fix: 全局改用 requests + asyncio.to_thread，不再需要 httpx 连接池
@@ -300,7 +356,13 @@ app = FastAPI(title="A股行情API", description="东方财富热搜榜、股票
 # 这类小响应不压，省 CPU。注意：手机走 cloudflared 隧道时 CF 边缘也会压一遍，
 # 本中间件主要收益在本地/局域网直连与回源段，不是重复劳动。
 app.add_middleware(GZipMiddleware, minimum_size=500)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Quote-Source", "X-Process-Time"])
+# 休市静态窗口整包缓存（2026-11-15）：必须挂在 GZip **外层**（add_middleware 是
+# insert(0)，所以后加的在外层），这样缓存的是已压缩 bytes，命中直接回放、不重复压。
+# 外层还有 CORS（每次补头）与 _config_reload_middleware（每次重算 X-Process-Time），
+# 命中路径照样经过它们，热加载配置与耗时排障不受影响。盘中完全旁路。
+from services.support.closed_response_cache import ClosedWindowCacheMiddleware
+app.add_middleware(ClosedWindowCacheMiddleware)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Quote-Source", "X-Process-Time", "X-Closed-Cache", "X-Closed-Cache-Age"])
 
 # 注册路由
 from app.api.routes import router
