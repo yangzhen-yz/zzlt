@@ -40,9 +40,22 @@ def _flag(key: str) -> bool:
 _FLAG_TO_CFG = {'universe_main_board_only': 'UNIVERSE_MAIN_BOARD_ONLY',
                 'universe_exclude_st': 'UNIVERSE_EXCLUDE_ST'}
 
+# 2026-11-15 性能：本地日K清单一天只变一次（18:15 同步），原来每轮保活都
+# `SELECT DISTINCT symbol FROM stock_daily` 全表扫 346.5 万行，空闲 0.65s、
+# 与预热/扫描抢资源时墙钟 52~66s。按库指纹缓存，指纹变了才重扫。
+_DB_SYMBOLS_CACHE = {'fp': '', 'value': []}
+# 配置改动代数：范围结果还受开关/阈值影响，配置一改就得让保活轮重算一次。
+_CACHE_EPOCH = 0
+
 
 def invalidate_cache() -> None:
-    """配置改动后打掉本进程缓存（范围清单 + ST 名录 + 选票范围）。"""
+    """配置改动后打掉本进程缓存（范围清单 + ST 名录 + 选票范围）。
+
+    2026-11-15：同时递增 `_CACHE_EPOCH`，让保活轮的「数据版本」指纹失效，
+    否则配置改了但日K库没变时，保活会误判「啥都没变」而跳过重建。
+    """
+    global _CACHE_EPOCH
+    _CACHE_EPOCH += 1
     _SCOPE_CACHE['value'] = []
     _SELECTABLE_CACHE['value'] = []
     _EXCLUDED_CACHE.update(ts=0.0, value=set())
@@ -120,16 +133,28 @@ def filter_symbols(symbols: Iterable[str]) -> Set[str]:
 
 
 def _db_symbols() -> List[str]:
-    """本地日K库里有历史数据的全部裸码（表缺失/库缺失返回空，交给调用方兜底）。"""
+    """本地日K库里有历史数据的全部裸码（表缺失/库缺失返回空，交给调用方兜底）。
+
+    2026-11-15：按 `kline_fingerprint` 缓存。清单只随日K库内容变，库没变就直接
+    返回副本——`refresh_caches()`、`settings_preview.scope_count()` 等所有调用方
+    都自动受益。空结果不缓存（库刚建好/表刚创建时要能立刻看到数据）。
+    """
+    from services.support import data_version
+    fp = data_version.kline_fingerprint(KLINE_HISTORY_DB_PATH)
+    if _DB_SYMBOLS_CACHE['value'] and _DB_SYMBOLS_CACHE['fp'] == fp:
+        return list(_DB_SYMBOLS_CACHE['value'])
     try:
         conn = sqlite3.connect(KLINE_HISTORY_DB_PATH, timeout=30)
         try:
-            return [r[0] for r in conn.execute(
+            result = [r[0] for r in conn.execute(
                 'SELECT DISTINCT symbol FROM stock_daily').fetchall() if r[0]]
         finally:
             conn.close()
     except sqlite3.Error:
         return []
+    if result:
+        _DB_SYMBOLS_CACHE.update(fp=fp, value=result)
+    return list(result)
 
 
 _SCOPE_CACHE = {'ts': 0.0, 'value': []}
@@ -276,6 +301,54 @@ def refresh_caches() -> None:
         selectable = scope
     _SCOPE_CACHE.update(ts=_time.time(), value=scope)
     _SELECTABLE_CACHE.update(ts=_time.time(), value=list(selectable))
+
+
+def apply_snapshot(payload: dict) -> None:
+    """把**子进程算好**的范围缓存原子换入本进程（2026-11-15 重活隔离）。
+
+    `heavy_tasks.compute_warm('warm_core')` 在独立进程里跑的还是原来的
+    `selectable_count()`，只是把结果对象取出来 pickle 给主进程；这里只做
+    赋值（微秒级），不在 HTTP 进程里再跑一遍全表 DISTINCT / 流动性聚合。
+
+    空值不回填：子进程某一段失败时宁可让本进程保持冷态由请求侧现算，
+    也不能用空清单把 5222 只票的缓存覆盖掉（那会让选股静默返回 0 只）。
+    """
+    import time as _time
+    now = _time.time()
+    scope = payload.get('scope') or []
+    selectable = payload.get('selectable') or []
+    db_symbols = payload.get('db_symbols') or []
+    if not scope or not db_symbols:
+        print('[股票范围] 子进程快照为空，跳过回填（请求侧冷兜底）')
+        return
+    _SCOPE_CACHE.update(ts=now, value=list(scope))
+    if selectable:
+        _SELECTABLE_CACHE.update(ts=now, value=list(selectable))
+    _DB_SYMBOLS_CACHE.update(fp=payload.get('db_symbols_fp', ''), value=list(db_symbols))
+    excluded = payload.get('excluded')
+    if excluded:
+        _EXCLUDED_CACHE.update(ts=now, value=set(excluded))
+
+
+def cache_epoch() -> int:
+    """配置改动代数，供保活轮拼进「数据版本」指纹。"""
+    return _CACHE_EPOCH
+
+
+def touch_caches() -> None:
+    """数据没变时只续期 TTL，不重算（2026-11-15 保活链用）。
+
+    必须续期而不是单纯跳过：三层缓存 TTL 都是 600s、保活每 540s 一轮，
+    若只跳过不续期，600s 后第一个请求就会撞冷路径（实测 3~8s），
+    `/api/settings` 还会另起一个后台线程重算摘要，比原来的问题更糟。
+    只对已有值续期；空缓存（配置刚改、还没算过）保持原样，让请求侧现算。
+    """
+    import time as _time
+    now = _time.time()
+    if _SCOPE_CACHE['value']:
+        _SCOPE_CACHE['ts'] = now
+    if _SELECTABLE_CACHE['value']:
+        _SELECTABLE_CACHE['ts'] = now
 
 
 def selectable_prefixed(symbols: Iterable[str]) -> list:

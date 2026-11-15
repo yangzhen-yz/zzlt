@@ -121,6 +121,31 @@ def last_stats_ts() -> float:
     return _STATS_TS
 
 
+def touch_stats() -> None:
+    """本地日K没变时只续期 TTL，不重算（2026-11-15 保活链用）。
+
+    `stats_map()` 的 TTL 是 600s、`_STATS` 又只在重算时赋值；保活轮若跳过
+    重算却不续期，600s 后第一个请求会现场付一次 14.9s 的全表聚合。
+    从没算过（`_STATS is None`）时不续期，让请求侧正常冷算。
+    """
+    global _STATS_TS
+    if _STATS is not None:
+        _STATS_TS = time.time()
+
+
+def apply_snapshot(payload: dict) -> None:
+    """回填子进程算好的流动性统计（2026-11-15 重活隔离）。
+
+    346.5 万行聚合原本每轮保活在主进程跑 12～170s，现在在独立进程算完
+    pickle 回来，这里只做一次赋值。`None` 不回填，保持冷态由请求侧现算。
+    """
+    global _STATS, _STATS_TS
+    stats = payload.get('stats')
+    if not stats:
+        return
+    _STATS, _STATS_TS = stats, time.time()
+
+
 def should_keepwarm_refresh(now: float, last_ts: float, max_age_sec: float,
                             force_flag: bool) -> bool:
     """保活循环这一轮要不要 force 重算流动性统计。抽成纯函数是为了能被自测直接跑，
