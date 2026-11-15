@@ -178,6 +178,20 @@ def _start_bg_rescan() -> None:
 
     if _swr_refresh_inflight:
         return
+    # 2026-11-15 GIL 根治：原来 `asyncio.create_task(scan_trend_task(force=True))`
+    # 挂在 uvicorn 主事件循环上。全市场扫描（线上 172.9s）期间**整个 loop 被
+    # 同步段占住**，所有页面请求连 404 都排队；独立线程池也救不了（GIL 同源）。
+    # 改成派发给短命子进程，主进程只登记一个单飞标志，跑完由
+    # `heavy_tasks.after_job('job_scan_trend')` 回读库结果并复位标志。
+    try:
+        from core import heavy_runner
+        if heavy_runner.enabled() and heavy_runner.submit('job_scan_trend', 'job'):
+            _swr_refresh_inflight = True
+            print('[趋势扫描] 后台重扫已派发到独立进程（不占用事件循环 / GIL）')
+            return
+    except Exception as e:
+        print(f'[趋势扫描] 重扫派发失败，退回事件循环内执行: {type(e).__name__}: {e}')
+    # 回滚路径：heavy_isolation.off / 环境变量 / 派发失败 → 保持改造前行为
     try:
         _swr_refresh_inflight = True
         asyncio.create_task(_run())

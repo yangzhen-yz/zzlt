@@ -176,8 +176,48 @@ def summary_age() -> float:
     return time.time() - _SUMMARY['ts']
 
 
+def touch_summary() -> None:
+    """本地日K/口径都没变时只续期摘要时间戳，不重算（2026-11-15 保活链用）。
+
+    必须续期：`routers/settings.py:45` 在 `summary_age() > 540` 时会调
+    `refresh_summary_async()` **另起一个后台线程**重算。保活轮若跳过
+    `compute_summary()` 却不管 ts，每个打开配置页的请求都会再拉起一个
+    196s 级重算线程，比原来的周期性卡顿更糟。没有快照时不续期。
+    """
+    if _SUMMARY['data'] is not None:
+        _SUMMARY['ts'] = time.time()
+
+
+def apply_snapshot(payload: dict) -> None:
+    """回填子进程算好的口径摘要（2026-11-15 重活隔离）。
+
+    必须同时更新 `ts`：`routers/settings.py:45` 在 `summary_age() > 540`
+    时会另起后台线程重算，只写 data 不写 ts 会立刻拉起一个 196s 级重算
+    线程，把刚隔离出去的重活又请回主进程。
+    """
+    data = payload.get('summary')
+    if data is None:
+        return
+    _SUMMARY.update(ts=time.time(), data=data)
+
+
 def refresh_summary_async() -> None:
-    """后台线程重算摘要（失败只打日志，读方继续用旧值）。"""
+    """后台重算摘要（失败只打日志，读方继续用旧值）。
+
+    2026-11-15：`routers/settings.py` 在 `summary_age() > 540` 时调这里，
+    原来起一个线程在 HTTP 主进程里跑 `compute_summary()`（线上 196.3s），
+    那段时间内所有请求排队。改派独立进程的 `warm_core`（同一套算法，
+    顺便把 universe/流动性也一起刷新），跑完由 `apply_snapshot` 回填；
+    失败或开关关闭仍退回原线程，功能不丢。
+    """
+    try:
+        from core import heavy_runner
+        if heavy_runner.enabled() and heavy_runner.submit('warm_core', 'warm'):
+            print('[配置] 口径摘要重算已派发到独立进程（不占主进程 GIL）')
+            return
+    except Exception as e:
+        print(f'[配置] 摘要重算派发失败，退回后台线程: {type(e).__name__}: {e}')
+
     def _run():
         try:
             compute_summary()

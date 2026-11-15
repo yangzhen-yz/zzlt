@@ -153,9 +153,16 @@ def _port_listening(port: Optional[int] = None) -> Optional[bool]:
     if port is None:
         port = int(_cfg('http_liveness_port', HTTP_LIVENESS_PORT))
     try:
+        # 中文 Windows 的 netstat 输出按 GBK 编码；text=True 默认 UTF-8 解码会在
+        # reader 线程抛 UnicodeDecodeError，导致 stdout 静默变成 None，进而在
+        # out.splitlines() 崩成 AttributeError —— 端口判据整个失效（11-15 实测：
+        # rc=0 但 stdout is None）。与 watchdog 里 tasklist/wmic 的教训同源。
         out = subprocess.run(['netstat', '-ano', '-p', 'TCP'], capture_output=True,
-                             text=True, timeout=10, creationflags=_NO_WINDOW).stdout
+                             text=True, encoding='gbk', errors='replace',
+                             timeout=10, creationflags=_NO_WINDOW).stdout
     except Exception:
+        return None
+    if out is None:                 # 读不到就按契约返回 None「不猜」，别炸
         return None
     want = ':' + str(port)
     for line in out.splitlines():
@@ -323,19 +330,28 @@ def _render(res: Dict[str, Any], now: datetime) -> str:
 
 def _send(text: str) -> bool:
     try:
-        from services.support.push import push_wecom_webhook
-        return bool(push_wecom_webhook(text))
+        from services.ops.alert_throttle import push_non_stock_alert
+        return push_non_stock_alert(text, source='http_liveness')
     except Exception as e:
         print(f'[后端自愈] 推送失败（不影响标志）: {e}')
         return False
 
 
 def _write_flag(res: Dict[str, Any]) -> bool:
-    """写重启标志。首行 token 是「这份是我写的」唯一凭据，恢复时按它认领。"""
+    """写重启标志。首行 token 是「这份是我写的」唯一凭据，恢复时按它认领。
+
+    2026-11-14：写入前再查一次文件是否存在。`check_once()` 判 flag_pending 与这里
+    真正 open('w') 之间有一段窗口（探活结果序列化、日志），实测 21:20:58 页面按钮
+    刚写的人工标志，21:21:00 就被本线程覆盖成自愈标志——判定那一刻文件还不存在。
+    原子性做不到，但把窗口从「一轮判定」压到「exists 到 open」这几微秒足够。
+    """
     p = res.get('probe') or {}
     flag = _flag_path()
     token = 'http_liveness pid=%d ts=%.3f' % (os.getpid(), time.time())
     try:
+        if os.path.exists(flag) and not _STATE.get('flag_by_us'):
+            print('[后端自愈] 写入前发现已有其它写入方的重启标志，本轮不覆盖（保留对方意图）')
+            return False
         parent = os.path.dirname(flag)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -409,7 +425,10 @@ def handle(res: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
                       % (now.strftime('%H:%M:%S'), res.get('streak'), p.get('state'),
                          '成功' if out['pushed'] else '失败'))
         else:
-            _log_once('write_failed', f'[后端自愈 {now:%H:%M:%S}] 写重启标志失败（下一轮重试）')
+            # 可能是写入异常，也可能是「已有别的写入方的标志、本轮主动跳过」，
+            # 两种都不算故障，下一轮按最新状态重判即可。
+            _log_once('write_skipped', f'[后端自愈 {now:%H:%M:%S}] 本轮未写重启标志'
+                      f'（已有其它写入方的标志，或写入失败），下一轮重判')
         return out
 
     verdict = res.get('verdict')

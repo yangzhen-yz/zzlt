@@ -29,7 +29,7 @@
 
 分仓与资金：当日有几只推荐就均分**当时可用**现金，100 股一手（高价票因此会自动少买，
 这是真实约束不是 bug）；卖出资金当日可用，所以下午能接早盘的回款。
-费用：佣金万 5（单边最低 5 元）+ 印花税千 1（卖出）+ 过户费万 0.1（双边）。
+费用：佣金万 5（单边最低 5 元）+ 印花税万 5（卖出）+ 过户费万 0.1（双边）。
 """
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -41,7 +41,7 @@ from app.config import (REC_SIM_BOARD_PRICE_V2, REC_SIM_DEFER_LIMIT_DOWN, REC_SI
 
 FEE_RATE = 0.0005       # 佣金（单边，万五）
 FEE_MIN = 5.0           # 单笔最低佣金
-STAMP = 0.001           # 印花税（卖出）
+STAMP = 0.0005          # 证券交易印花税（卖出，2023-08-28 起减半）
 TRANSFER = 0.00001      # 过户费（双边）
 
 ENTRIES = {
@@ -651,7 +651,7 @@ def open_hold_excess(months: int = 6, since: Optional[str] = None,
         'byDay': by_day, 'byMonth': by_month, 'skipped': skipped,
         'scopeText': scope_desc,
         'slippageBpsPerSide': slippage_bps,
-        'feeModel': '佣金单边万五（最低5元）+卖出印花税千一+双边过户费万0.1',
+        'feeModel': '买卖佣金单边万五（最低5元）+卖出印花税万五+双边过户费万0.1',
         'commissionRatePerSide': FEE_RATE,
         'commissionMinimum': FEE_MIN,
         'costModel': '费用按feeModel；双边滑点按指定基点恶化成交价。历史基准使用当前股票范围，存在幸存者偏差。',

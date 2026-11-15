@@ -466,6 +466,15 @@ SPEC: List[Dict[str, Any]] = [
         'impact': None,
     },
     {
+        'key': 'ops_service_alert_daily_limit', 'default': 2, 'kind': 'int',
+        'label': '非股票服务异常推送每日上限', 'group': '运维与自愈', 'live': True,
+        'min': 0, 'max': 2, 'step': 1, 'unit': '次/日',
+        'note': '调度失活、HTTP 自愈、数据库写锁三类运维异常共用此上限，按本机自然日计并跨后端重启保留；'
+                '股票推荐/行情类推送不计入。设为 0 会暂停这三类异常推送，设为 1 或 2 控制每日最多通知数。'
+                '额度只在发送成功后计数，无法安全读取限频状态时本次会阻止推送并记日志。',
+        'impact': None,
+    },
+    {
         'key': 'http_liveness_interval_sec', 'cfg': 'HTTP_LIVENESS_INTERVAL_SEC', 'kind': 'int',
         'label': 'HTTP 探活间隔', 'group': '运维与自愈', 'live': False,
         'min': 10, 'max': 300, 'step': 10, 'unit': '秒',

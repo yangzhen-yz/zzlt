@@ -18,6 +18,7 @@ import datetime as dt
 import io
 import os
 import sqlite3
+import shutil
 import sys
 import tempfile
 import time
@@ -29,6 +30,11 @@ sys.path.insert(0, SERVER)
 import app.config as cfg                       # noqa: E402
 import db.database as dbmod                    # noqa: E402
 from services.ops import sched_liveness as L   # noqa: E402
+from services.ops import alert_throttle as T   # noqa: E402
+
+_THROTTLE_TMP = tempfile.mkdtemp(prefix='sched_alert_throttle_')
+T.STATE_PATH = os.path.join(_THROTTLE_TMP, 'state.json')
+T._daily_limit = lambda: 100
 
 PASS, FAIL = [], []
 _SENT = []          # 桩：记录本应发出去的告警正文
@@ -519,6 +525,7 @@ finally:
 
 
 print(f'\n结果：{len(PASS)} 通过 / {len(FAIL)} 失败')
+shutil.rmtree(_THROTTLE_TMP)
 if FAIL:
     for m in FAIL:
         print('  失败：', m)

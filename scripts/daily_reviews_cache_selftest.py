@@ -22,6 +22,11 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'server'))
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+# 2026-11-15：本自测把 _build_daily_reviews_entry 换成假数据后打进程内 ASGI。
+# 全站休市响应缓存会把「线上磁盘快照里的真实响应」直接回放，导致 mock 根本不
+# 被调用、断言读到脏数据。自测必须绕过这一层（等价于一键回滚开关），否则测的
+# 不是本页自己的 SWR/ETag/分页逻辑。
+os.environ['CLOSED_CACHE'] = '0'
 
 import httpx
 
@@ -48,7 +53,10 @@ def _mk(payload):
 
 
 async def main():
-    from app.api import routes as r
+    # 2026-10-29 路由拆分后，收评分页的实现在 routers/review.py（它 `from ..routes_state import *`
+    # 顶层复制了函数对象）。继续 patch 薄聚合模块 app.api.routes 不会改变路由实际调用
+    # 的那个名字，fake_build 根本不生效、断言读到真实 DB 数据 —— 这是拆分后遗留的假红。
+    from app.api.routers import review as rv
     from app.main import app
 
     # 用可控的假数据替换「查库 + 序列化」，验证缓存语义而非 DB 本身
@@ -72,9 +80,9 @@ async def main():
             },
         }
 
-    orig = r._build_daily_reviews_entry
-    r._build_daily_reviews_entry = fake_build
-    r._invalidate_daily_reviews_cache()
+    orig = rv._build_daily_reviews_entry
+    rv._build_daily_reviews_entry = fake_build
+    rv._invalidate_daily_reviews_cache()
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url='http://test') as c:
@@ -122,14 +130,14 @@ async def main():
 
             check('④ 三次请求只构建一次', calls['n'] == 1, f"calls={calls['n']}")
 
-            r._invalidate_daily_reviews_cache()
+            rv._invalidate_daily_reviews_cache()
             payload_src['v'] = 2
             r4 = await c.get('/api/daily-reviews?page=1')
             check('⑤ 失效后重新构建', calls['n'] == 2, f"calls={calls['n']}")
             check('⑤ 内容变化后 ETag 变化', r4.headers.get('etag') != etag,
                   f'{etag} -> {r4.headers.get("etag")}')
 
-            r._invalidate_daily_reviews_cache()
+            rv._invalidate_daily_reviews_cache()
             r5 = await c.get('/api/daily-reviews?page=1')
             check('⑥ 内容不变时 ETag 稳定', r5.headers.get('etag') == r4.headers.get('etag'))
 
@@ -179,11 +187,11 @@ async def main():
                   and oob.json().get('total') == 3,
                   f"body={str(oob.json())[:80]}")
             check('⑪ 越界页不额外查库/不污染缓存',
-                  calls['n'] == 3 and 'all' in r._DAILY_REVIEWS_CACHE,
-                  f"calls={calls['n']} cache_keys={list(r._DAILY_REVIEWS_CACHE)}")
+                  calls['n'] == 3 and 'all' in rv._DAILY_REVIEWS_CACHE,
+                  f"calls={calls['n']} cache_keys={list(rv._DAILY_REVIEWS_CACHE)}")
     finally:
-        r._build_daily_reviews_entry = orig
-        r._invalidate_daily_reviews_cache()
+        rv._build_daily_reviews_entry = orig
+        rv._invalidate_daily_reviews_cache()
 
     print(f'\n结果: {PASS} 通过 / {FAIL} 失败')
     return 0 if FAIL == 0 else 1

@@ -563,7 +563,7 @@
     return null
   }
 
-  async function fetchStockQuote(symbol, silent = false) {
+  async function fetchStockQuote(symbol, silent = false, force = false) {
     if (!symbol) return
     const seq = ++_reqSeq
     const formatted = symbol.toLowerCase()
@@ -578,7 +578,9 @@
     }
     try {
       // 2026-07-08 性能优化：合并行情+评分为单一接口，从 2 个并行请求 → 1 个请求
-      const resp = await fetch(`/api/stock/${formatted}/full`).then(r => r.json())
+      // 2026-11-15：休市日后端会命中「行情静态缓存」，force=1 仅供手动刷新绕过
+      const url = `/api/stock/${formatted}/full${force ? '?force=1' : ''}`
+      const resp = await fetch(url).then(r => r.json())
       if (seq !== _reqSeq) return // 已有更新的请求，丢弃过期响应
       if (!resp || !resp.success) {
         throw new Error(resp?.detail || '数据获取失败')
@@ -665,7 +667,8 @@
   }
 
   function manualRefresh() {
-    if (currentSymbol.value) fetchStockQuote(currentSymbol.value)
+    // 手动刷新必须绕过休市静态缓存，否则点了没反应（价格确实不变，但要能重新取源）
+    if (currentSymbol.value) fetchStockQuote(currentSymbol.value, false, true)
   }
 
   function selectQuickStock(code) {

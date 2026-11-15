@@ -1,6 +1,7 @@
 """Domain router: stock."""
 
 from fastapi import APIRouter
+from fastapi.responses import Response
 from ..routes_state import *
 
 router = APIRouter()
@@ -102,16 +103,29 @@ async def get_stock_analysis(symbol: str):
 
 
 @router.get("/api/stock/{symbol}/full", tags=["股票行情"])
-async def get_stock_full(symbol: str):
+async def get_stock_full(symbol: str, force: bool = False, response: Response = None):
     """单只股票行情+评分合并接口（2026-07-08 性能优化）
 
     替代原先 2 个并行请求（/api/stock/{symbol} + /api/stock/{symbol}/analysis），
     一次返回行情原始字符串 + 解析数据 + 10因子评分，减少 50% HTTP 请求数。
     评分结果带 3 秒内存缓存，适配 2 秒轮询。
+
+    2026-11-15：休市/非交易时段价格是上一交易日收盘定格值，增强数据也全是日频，
+    但原来每次仍去外网拉行情 + 并行 5 项增强（实测 x-process-time 2973ms）。
+    静态窗口改走整包缓存（含落盘，重启后仍热），盘中完全旁路保持 2s 轮询实时性；
+    `force=1` 供「手动刷新」绕过缓存。
     """
     if not re.match(r'^(sh|sz)\d{6}$', symbol.lower()):
         raise HTTPException(status_code=400, detail="无效的股票代码格式，示例: sh603985, sz000001")
     sym = symbol.lower()
+    from services.support import quote_static_cache as _qsc
+    _static_hit = _qsc.get(sym, force=force)
+    if _static_hit is not None:
+        if response is not None:
+            response.headers['X-Quote-Cache'] = 'static-hit'
+        return _static_hit
+    _static = _qsc.is_static_window()
+    _timed_out: list = []
     try:
         # 评分缓存（3 秒 TTL，适配 2 秒轮询，偶数次命中缓存）
         import time as _time; from services.data.stock import _analysis_cache
@@ -125,8 +139,10 @@ async def get_stock_full(symbol: str):
             # 1.3~8s、龙虎榜东财 15s、腾讯行情重试最多 ~7s；旧写法把这些全串在单票请求
             # 关键路径上，线上切票实测 16.7s / 23.9s。wait_for 只取消 Future，to_thread 的
             # 线程会继续跑完并写各自缓存，下一次 2s 轮询自动补齐 → 首屏快、最终数据完整。
-            _ENRICH_TIMEOUT = 1.2
-            _timed_out: list = []
+            # 2026-11-15：休市/非交易时段没有「首屏必须快」的实时性压力，
+            # 反而要尽量拿到完整的 5 项增强数据才能写一份能长期复用的缓存。
+            # 盘中维持 1.2s 的快闸门（2 秒轮询口径不变）。
+            _ENRICH_TIMEOUT = 2.5 if _static else 1.2
 
             async def _guarded(label, coro, default):
                 try:
@@ -204,7 +220,7 @@ async def get_stock_full(symbol: str):
         # 买卖点（V4.6 位置感知版）：raw 始终可用（缓存命中或新拉取），解析后纯函数计算
         _parsed_full = parse_tencent_batch_data(raw) if raw else []
         buy_sell_points = _recommend_svc.calc_buy_sell_points(_parsed_full[0], score_result=result) if _parsed_full else {}
-        return {
+        resp = {
             "success": True,
             "data": {
                 "symbol": sym,
@@ -222,6 +238,16 @@ async def get_stock_full(symbol: str):
                 "details": details,
             }
         }
+        # 2026-11-15：静态窗口内一律写缓存，但降级结果只给 5 分钟有效期。
+        # 第一版「只在完整路径写」实测 5 只票只有 2 只入缓存（增强项偶发超时
+        # 是常态），判据太严反而把缓存架空了。盘中不写，保持 2 秒轮询实时性。
+        if _static:
+            _qsc.put(sym, resp, degrade=bool(_timed_out))
+            if _timed_out:
+                print(f'[行情静态缓存] {sym} 降级写入（增强项超时: {",".join(_timed_out)}；5 分钟后重取）')
+        if response is not None:
+            response.headers['X-Quote-Cache'] = 'miss'
+        return resp
     except HTTPException:
         raise
     except Exception as error:

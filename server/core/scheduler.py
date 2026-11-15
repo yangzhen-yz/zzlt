@@ -152,8 +152,35 @@ def _run_pending_guarded() -> None:
     _ran = 0
     _errs = 0
     for job in sorted(due, key=lambda j: (j.next_run or now)):
-        name = getattr(getattr(job, 'job_func', None), '__name__', None) or repr(job.job_func)[:60]
+        # schedule 把 job_func 包成 functools.partial；本机版本会把 `__name__`
+        # 透传过来，但不同版本不保证，所以补一层 `.func` 兜底。取不到名字就
+        # 退回 repr（那时 `should_isolate` 判 False，本轮安全退回本进程执行）。
+        _jf = getattr(job, 'job_func', None)
+        name = (getattr(_jf, '__name__', None)
+                or getattr(getattr(_jf, 'func', None), '__name__', None)
+                or repr(_jf)[:60])
         try:
+            # 2026-11-15 GIL 根治：定时 job 的重计算派到**独立短命进程**。
+            # 这些 job 的结果本来就落库、返回值全部被丢弃，主进程唯一要补的
+            # 是写后失效（heavy_tasks.after_job）。派发失败/开关关闭就原样
+            # 走 job.run()，业务行为一字不变。
+            _isolated = False
+            try:
+                from core import heavy_runner, heavy_tasks
+                if heavy_tasks.should_isolate(name):
+                    _isolated = heavy_runner.submit(name, 'job')
+            except Exception as _iso_err:
+                print(f'[定时任务 {datetime.now():%H:%M:%S}] 重活派发器异常，'
+                      f'「{name}」退回本进程执行: {type(_iso_err).__name__}: {_iso_err}')
+            if _isolated:
+                # job.run() 会在 job_func 返回后推进 next_run；这里跳过它，
+                # 必须自己推进，否则该 job 每 10 秒仍"到点"、会被无限重复派发。
+                try:
+                    job._schedule_next_run()
+                except Exception:
+                    job.next_run = datetime.now() + timedelta(hours=24)
+                _ran += 1
+                continue
             ret = job.run()
             if isinstance(ret, schedule.CancelJob) or ret is schedule.CancelJob:
                 schedule.cancel_job(job)
@@ -274,6 +301,138 @@ _PREWARM_GATE = threading.Lock()
 _PREWARM_START_DELAY = 15   # 秒：启动后先不预热，保证重启瞬间页面可访问
 _PREWARM_GAP = 2            # 秒：相邻预热项之间的空窗
 
+# ── 2026-11-15 重活隔离：定时 job 的跨进程注册表 ──────────────────────────
+# `run_scheduler()` 里的 job 都是**闭包**（定义在函数体内），没法直接 pickle
+# 给子进程。子进程用 `run_scheduler(register_only=True)` 重建一遍这些闭包，
+# 再从这张表里按名字取原函数执行 —— 跑的还是同一个函数对象，不是复制实现。
+_JOB_REGISTRY: dict = {}
+_WARM_REGISTRY: dict = {}
+
+# 一次性启动预热段 → 子进程任务步骤名。`prewarm-universe` 是**常驻保活线程**
+# （每 540s 续期三层缓存），必须留主进程，不在这张表里。
+_PREWARM_TASK_BY_NAME = {
+    'prewarm-hot-scan': '_prewarm_hot_scan',
+    'prewarm-excess': '_prewarm_excess',
+    'prewarm-vol': '_prewarm_vol',
+    'prewarm-quote-deps': '_prewarm_quote_deps',
+    'prewarm-misc': '_prewarm_misc',
+    'prewarm-heavy': '_prewarm_heavy',
+}
+# 收集本轮该跑的一次性预热段，最后合并成**一个**子进程任务串行执行。
+_PENDING_WARM: list = []
+
+
+def _build_job_registry(namespace: dict) -> None:
+    """把当前作用域里的 `job_*` / `_prewarm_*` 登记到模块级表，供子进程取用。
+
+    job 一律以 `schedule` 里**实际注册**的函数为准，而不是 `namespace` 里的
+    原函数：十多个 job 被 `_warp_trading_only` 包了一层交易日守卫，若子进程
+    拿原函数去跑，休市日会绕过守卫写影子表/回测表（行为回归）。`wraps` 保证
+    包装后的 `__name__` 仍是原 job 名，所以表键不变。
+    """
+    _JOB_REGISTRY.clear()
+    _WARM_REGISTRY.clear()
+    _JOB_REGISTRY.update({k: v for k, v in namespace.items()
+                          if k.startswith('job_') and callable(v)})
+    try:
+        import schedule
+        for j in schedule.get_jobs():
+            f = getattr(j, 'job_func', None)
+            n = (getattr(f, '__name__', '')
+                 or getattr(getattr(f, 'func', None), '__name__', ''))
+            if n.startswith('job_') and callable(f):
+                _JOB_REGISTRY[n] = f
+    except Exception as e:
+        print(f'[重活隔离] 无法从 schedule 校正 job 注册表（退回原始闭包）: {e}')
+    _WARM_REGISTRY.update({k: v for k, v in namespace.items()
+                           if k.startswith('_prewarm_') and callable(v)})
+
+
+def _spawn_prewarm(register_only: bool, target, name: str) -> None:
+    """一次性预热改为「收集待派发」，常驻保活线程仍在主进程起。
+
+    子进程走 `register_only=True` 时只重建闭包，绝不起任何线程（否则会
+    跑出第二套调度/预热链）。
+    """
+    if register_only:
+        return
+    if name in _PREWARM_TASK_BY_NAME:
+        _PENDING_WARM.append((target, name, _PREWARM_TASK_BY_NAME[name]))
+        return
+    threading.Thread(target=target, daemon=True, name=name).start()
+
+
+def submit_warm_rest(steps: str) -> bool:
+    """把一次性预热合并派发给一个子进程；开关关闭/失败时返回 False 由调用方回滚。"""
+    try:
+        from core import heavy_runner
+        if not heavy_runner.enabled() or not steps:
+            return False
+        return heavy_runner.submit('warm_rest', 'warm', timeout=1800,
+                                  extra={'steps': steps})
+    except Exception as e:
+        print(f'[预热 {datetime.now():%H:%M:%S}] 一次性预热派发失败，'
+              f'退回本进程线程执行: {type(e).__name__}: {e}')
+        return False
+
+
+def submit_warm_core(timeout: int = 900) -> bool:
+    """把 universe / 流动性 / 口径摘要三层缓存的重算派到独立进程。
+
+    启动预热与「数据版本变了」的保活轮共用这一条路径。子进程算完把结果
+    pickle 回来，`heavy_tasks.apply_warm()` 在主进程做字典赋值并认领 fp；
+    失败/开关关闭时返回 False，调用方原样走本进程重算（可随时回滚）。
+    """
+    try:
+        from core import heavy_runner
+        if not heavy_runner.enabled():
+            return False
+        return heavy_runner.submit('warm_core', 'warm', timeout=timeout)
+    except Exception as e:
+        print(f'[预热 {datetime.now():%H:%M:%S}] 三层缓存派发失败，'
+              f'退回本进程重算: {type(e).__name__}: {e}')
+        return False
+
+
+# ── 2026-11-15 性能：把「周期性重算」改成「数据版本变了才重算」 ──────────────
+# 事故/现象：单进程 uvicorn 与这些 daemon 预热线程共享同一个 GIL。预热链 11-15
+# 实测合计 1103s（18 分 23 秒）、常驻保活每 540s 一轮 169.2s（占空比约 31%）；
+# 期间所有 HTTP 请求（连 404 空路由）都在「进 app 之前」排队 1~14s，自愈探活
+# 反复 timeout 8~14s。而保活轮的输入是本地日K库，一天只在 18:15 同步后变一次。
+# 修法：给「日K库内容 + 配置代数」算一个指纹，没变就只续期三层缓存的 TTL，
+# 不重算；变了才跑原来那一整套。指纹只做 os.stat，不查库、不抢锁。
+_KEEPWARM_STATE = {'fp': ''}
+# 休市日是否仍跑重预热（一键回滚：改成 True 即恢复 11-15 之前的行为）
+_HEAVY_PREWARM_ON_HOLIDAY = False
+
+
+def current_data_fp() -> str:
+    """「本地日K库内容 + 范围配置代数」的当前版本指纹。"""
+    from app.config import KLINE_HISTORY_DB_PATH
+    from services.data import universe
+    from services.support import data_version
+    return '%s|%d' % (data_version.kline_fingerprint(KLINE_HISTORY_DB_PATH),
+                      universe.cache_epoch())
+
+
+def keepwarm_should_recompute(last_fp: str, now_fp: str) -> bool:
+    """保活轮要不要重算：从没记过 / 指纹变了 → 重算；没变 → 只续期。
+
+    抽成纯函数是为了能被长期回归自测直接跑，而不是在测试里另抄一遍条件。
+    """
+    return (not last_fp) or (last_fp != now_fp)
+
+
+def heavy_prewarm_due(is_trading: bool,
+                      allow_holiday: bool = _HEAVY_PREWARM_ON_HOLIDAY) -> bool:
+    """启动时的三段重预热（全量批量扫描 / 可执行超额回测 / 重计算冷缓存）该不该跑。
+
+    这三段的输入全是收盘数据与本地日K，休市日不会变；11-15 周日实测仍跑了
+    203.9s + 527s + 94s 全量重算，纯属白付。休市日跳过后由请求侧 SWR 冷兜底
+    （首开某个页多等一次，但不再让全站一起卡十几分钟）。
+    """
+    return bool(is_trading) or bool(allow_holiday)
+
 
 def _serial_prewarm(fn):
     """启动预热项装饰器：延迟启动 + 全局串行 + 项间让出，不改原函数体。"""
@@ -292,7 +451,13 @@ def _serial_prewarm(fn):
     return _wrapper
 
 
-def run_scheduler():
+def run_scheduler(register_only: bool = False):
+    """启动调度器。
+
+    `register_only=True` 只重建 job 闭包并填 `_JOB_REGISTRY`，不打印清单、
+    不起任何线程、不进主循环 —— 专供 **重活子进程** (`core.heavy_worker`)
+    用，让它在自己的解释器里拿到与主进程完全相同的定时任务函数对象。
+    """
     # 2026-10-17 启动预热：universe 选票范围首算要 ~5s（流动性聚合），
     # 不预热则重启后第一次开配置页白等 5s。放后台线程跑，不阻塞调度器注册。
     # 2026-10-30 升级为**常驻保活**：universe 两层缓存与流动性统计的 TTL 都是 600s，
@@ -300,9 +465,21 @@ def run_scheduler():
     # 配置页/海选）实测要再付 3~8s 冷算（10-30 16:13 筛选页 8.71s 即此因）。
     # 改为每 540s 后台刷新一次，永远赶在过期前；先算好再原子换入
     # （universe.refresh_caches），刷新窗口内请求继续用旧值，不撞冷路径。
+    _heavy_due = heavy_prewarm_due(_today_is_trading())
+    if not _heavy_due:
+        print(f'[预热 {datetime.now():%H:%M:%S}] 休市日：跳过三段重预热'
+              f'（批量扫描 / 超额回测 / 重计算冷缓存），请求侧 SWR 按需冷兜底')
     @_serial_prewarm
     def _prewarm_universe_first():
         import time as _time
+        # 2026-11-15 重活隔离：全表 DISTINCT（5222 只）+ 流动性聚合
+        # （346.5 万行）+ 口径摘要原本在 HTTP 主进程跑，线上实测 16.8s
+        # 与 196.3s，期间所有请求在进 app 之前排队。改为独立进程算好
+        # pickle 回来，主进程只做一次字典赋值（微秒级）。
+        if submit_warm_core():
+            print(f'[预热 {datetime.now():%H:%M:%S}] 三层缓存重算已派发到独立进程'
+                  f'（主进程不占 GIL；完成后回填并认领数据版本）')
+            return
         from services.data import universe
         _t = _time.time()
         try:
@@ -317,6 +494,9 @@ def run_scheduler():
             _t2 = _time.time()
             settings_preview.compute_summary()
             print(f'[预热 {datetime.now():%H:%M:%S}] 配置页口径摘要缓存完成（{_time.time() - _t2:.1f}s）')
+            # 启动段已把这一版数据算进三层缓存，记下指纹；否则 540s 后第一轮
+            # 保活会因为 last_fp 为空再白重算一次（又是一段 169s 的降级窗口）。
+            _KEEPWARM_STATE['fp'] = current_data_fp()
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 口径摘要预热失败（首次请求会现算兜底）: {e}')
 
@@ -329,9 +509,29 @@ def run_scheduler():
             from services.data import liquidity, universe
             from services.support import settings_preview
             _t = _time.time()
+            # 2026-11-15：数据版本没变就只续期、不重算。原来这一轮无条件
+            # refresh_caches()（绕过 600s 缓存全表 DISTINCT）+ compute_summary()
+            # （parity_check 再扫一遍全市场），线上实测 169.2s / 轮、每 540s 一次。
+            _now_fp = current_data_fp()
+            if not keepwarm_should_recompute(_KEEPWARM_STATE['fp'], _now_fp):
+                universe.touch_caches()
+                liquidity.touch_stats()
+                settings_preview.touch_summary()
+                print(f'[预热 {datetime.now():%H:%M:%S}] 保活跳过重算'
+                      f'（日K数据/口径未变，仅续期三层缓存；{_time.time() - _t:.3f}s；'
+                      f'fp={_now_fp[:16]}）')
+                return
             # 流动性统计不再每轮 force 重算（2026-11-04）：它的输入是本地日K，盘中根本不变，
             # 而单算一次实测 14.9s（346.5 万行、无 date 前导索引），线上那一行日志因此是
             # 12~170s，每 9 分钟跟推送扫描/同步抢一轮资源。判据抽成纯函数便于自测。
+            if submit_warm_core():
+                # fp 不在主进程认领：由 apply_warm() 在**回填成功**后用子进程
+                # 算出的 kline_fp + 主进程 cache_epoch 拼好写上。子进程失败时
+                # 保持旧 fp，下一轮自然会重试 —— 与原来「整轮成功才认领」同义。
+                print(f'[预热 {datetime.now():%H:%M:%S}] 数据已变：三层缓存重算'
+                      f'派发到独立进程（主进程不占 GIL；fp={_now_fp[:16]}）')
+                return
+            # 回滚路径（heavy_isolation.off / 环境变量 / 派发失败）：原样本进程重算
             _need = liquidity.should_keepwarm_refresh(
                 _time.time(), liquidity.last_stats_ts(),
                 LIQ_STATS_KEEPWARM_MAX_AGE_SEC, LIQ_STATS_KEEPWARM_FORCE)
@@ -342,9 +542,10 @@ def run_scheduler():
                 _tl = _time.time() - _t0
             universe.refresh_caches()          # 再重算两层范围并原子换入
             settings_preview.compute_summary() # 配置页摘要随热缓存重算（热路径 <1s）
+            _KEEPWARM_STATE['fp'] = _now_fp   # 只在整轮成功才认这一版，失败下轮重试
             _liq_txt = ('流动性重算 %.1fs' % _tl) if _need else '流动性跳过（日K未变）'
             print(f'[预热 {datetime.now():%H:%M:%S}] universe/口径摘要保活完成'
-                  f'（{_time.time() - _t:.1f}s；{_liq_txt}）')
+                  f'（{_time.time() - _t:.1f}s；{_liq_txt}；fp={_now_fp[:16]}）')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] universe 保活刷新失败（不影响请求，下轮再试）: {e}')
 
@@ -354,7 +555,7 @@ def run_scheduler():
         while True:
             time.sleep(540)  # 9 分钟 < 600s TTL
             _keepwarm_round()
-    threading.Thread(target=_keepwarm_universe, daemon=True, name='prewarm-universe').start()
+    _spawn_prewarm(register_only, _keepwarm_universe, 'prewarm-universe')
 
     # 批量扫描预热（2026-10-30）：重启后第一次打开筛选页要付一次全量冷算
     # （实测 2.2~2.9s，超"页面 2s 内"目标）。用**全部用户池的并集**构建宇宙
@@ -387,7 +588,10 @@ def run_scheduler():
             print(f'[预热 {datetime.now():%H:%M:%S}] 行动台缓存完成（{_time.time() - _t:.1f}s）')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 行动台预热失败（首开会现算）: {e}')
-    threading.Thread(target=_prewarm_hot_scan, daemon=True, name='prewarm-hot-scan').start()
+    if _heavy_due:
+        _spawn_prewarm(register_only, _prewarm_hot_scan, 'prewarm-hot-scan')
+    else:
+        print(f'[预热 {datetime.now():%H:%M:%S}] 休市日跳过批量扫描/行动台预热')
 
     # 可执行超额预热（2026-10-27）：`/api/recommend-excess` 冷算实测 7.4s，而前端默认 10s
     # 超时——重启后第一个开「回测曲线」页的人正好撞上（当天实拍：超额没算出来：请求超时（10s））。
@@ -400,7 +604,10 @@ def run_scheduler():
             print(f'[预热 {datetime.now():%H:%M:%S}] 可执行超额缓存完成（冷算 {sec:.1f}s）')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 超额预热失败（不致命，首次请求会现算）: {e}')
-    threading.Thread(target=_prewarm_excess, daemon=True, name='prewarm-excess').start()
+    if _heavy_due:
+        _spawn_prewarm(register_only, _prewarm_excess, 'prewarm-excess')
+    else:
+        print(f'[预热 {datetime.now():%H:%M:%S}] 休市日跳过可执行超额回测预热')
 
     # 区间带宽波动率预热（2026-10-19 动态区间宽度）：这份缓存是一次"全市场近 6 个已收盘
     # 交易日收盘序列"的**同步** SQLite 查询。不预热的话，09:45 批次里第一只票会在 asyncio
@@ -419,7 +626,7 @@ def run_scheduler():
                   f'{len(m)} 只票有收盘序列')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 波动率预热失败（不致命，带宽退回核心值）: {e}')
-    threading.Thread(target=_prewarm_vol, daemon=True, name='prewarm-vol').start()
+    _spawn_prewarm(register_only, _prewarm_vol, 'prewarm-vol')
 
     # 单票行情页依赖预热（2026-11-04）：/api/stock/{symbol}/full 首次访问会连付三笔冷启动
     # 成本：history_available() 全表统计 8.0s、compute_trend_result 首只 6.7s、龙虎榜东财
@@ -449,7 +656,7 @@ def run_scheduler():
             print(f'[预热 {datetime.now():%H:%M:%S}] 龙虎榜后台刷新已触发')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 龙虎榜预热失败（不致命）: {e}')
-    threading.Thread(target=_prewarm_quote_deps, daemon=True, name='prewarm-quote-deps').start()
+    _spawn_prewarm(register_only, _prewarm_quote_deps, 'prewarm-quote-deps')
 
     # 分钟级只读数据源预热（2026-11-04 全站巡检）：热态基准实测 /api/theme-index 2.92s、
     # /api/kline-history/stats 1.44s、/api/market-index 1.19s、/api/cls-ladder 1.16s。
@@ -503,7 +710,7 @@ def run_scheduler():
                 print(f'[预热 {datetime.now():%H:%M:%S}] 收评预热失败（首开会现算）: {e}')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 分钟级数据源预热整体失败（不致命）: {e}')
-    threading.Thread(target=_prewarm_misc, daemon=True, name='prewarm-misc').start()
+    _spawn_prewarm(register_only, _prewarm_misc, 'prewarm-misc')
 
     # 重计算冷缓存预热（2026-11-04 全站巡检第 2 轮）：SWR 只保证「缓存里有值」时不阻塞，
     # 重启后第一次访问仍会撞 cold。冷/热态基准实测重启后首访：
@@ -577,7 +784,10 @@ def run_scheduler():
                 print(f'[预热 {datetime.now():%H:%M:%S}] 资金流预热失败（首开会现算）: {e}')
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 重计算预热整体失败（不致命）: {e}')
-    threading.Thread(target=_prewarm_heavy, daemon=True, name='prewarm-heavy').start()
+    if _heavy_due:
+        _spawn_prewarm(register_only, _prewarm_heavy, 'prewarm-heavy')
+    else:
+        print(f'[预热 {datetime.now():%H:%M:%S}] 休市日跳过重计算冷缓存预热')
 
     def job_update_hot_search_ranking():
         asyncio.run(update_hot_search_ranking_task())
@@ -1439,6 +1649,12 @@ def run_scheduler():
     # ---- 注册定时任务 ----
     # 热搜榜：非交易日不跑，没意义
     def _warp_trading_only(fn):
+        # 2026-11-15：加 wraps 让 `job.job_func.__name__` 保留原名。否则
+        # `_run_pending_guarded()` 的日志十个 job 全叫 `_wrapped`，且重活隔离
+        # 的 name 判据认不出它们 —— 盘后那批最重的影子/回测 job 会全漏掉。
+        from functools import wraps
+
+        @wraps(fn)
         def _wrapped():
             if not _today_is_trading():
                 return
@@ -1607,6 +1823,29 @@ def run_scheduler():
     # 接口用量：每 60s 把内存计数器落库（2026-10-19，防第三方平台封禁的观测手段）
     schedule.every(60).seconds.do(job_api_usage_flush)
     print(f'[定时任务]   - 每 60s: 接口用量计数落库（第三方 API 调用观测，防封禁）')
+
+    # 子进程在这里就够了：闭包已定义、注册表已填，剩下的清单打印、观察线程、
+    # 主循环都属主进程职责。少 import 一大截，冷启动也更快。
+    _build_job_registry(locals())
+    if register_only:
+        return
+
+    # 2026-11-15 GIL 根治：把本轮该跑的一次性预热合并成**一个**子进程任务。
+    # 原来 6 段各起一个线程、由 `_PREWARM_GATE` 串行，交易日实测含 203.9s
+    # 批量扫描与 527s 回测，全部压在 HTTP 进程的 GIL 上；现在主进程只做
+    # 一次 spawn，子进程内按原顺序串行跑完再把缓存快照整体 pickle 回来。
+    if _PENDING_WARM:
+        _pending = list(_PENDING_WARM)
+        _PENDING_WARM.clear()
+        _steps = ','.join(x[2] for x in _pending)
+        if submit_warm_rest(_steps):
+            print(f'[预热 {datetime.now():%H:%M:%S}] {len(_pending)} 段一次性预热'
+                  f'已合并派发到独立进程（主进程不占 GIL；完成后回填缓存快照）')
+        else:
+            print(f'[预热 {datetime.now():%H:%M:%S}] 重活隔离关闭/派发失败：'
+                  f'{len(_pending)} 段预热退回本进程线程执行')
+            for _target, _name, _ in _pending:
+                threading.Thread(target=_target, daemon=True, name=_name).start()
 
     _now = datetime.now()
     print(f'\n[定时任务 {_now:%Y-%m-%d %H:%M:%S}] 已注册以下定时任务（今日交易日={_today_is_trading()}）：')
