@@ -81,9 +81,11 @@ async def refresh_fundamental_api():
 
 @router.get("/api/dragon-tiger", tags=["聪明钱"])
 async def get_dragon_tiger_api(days: int = SMART_MONEY_DRAGON_TIGER_DAYS, top_n: int = 30, force: bool = False):
-    """龙虎榜聪明钱聚合榜（P1b）。返回近 days 日上榜个股净买入排名。force=true 时忽略缓存。"""
+    """龙虎榜聪明钱聚合榜（P1b）。返回近 days 日上榜个股净买入排名。force=true 时忽略缓存。
+
+    2026-11-16 性能：get_dragon_tiger 内部含同步东财请求 + SQLite 读写，移入 to_thread。"""
     try:
-        data = get_dragon_tiger(days, top_n, force=force)
+        data = await asyncio.to_thread(get_dragon_tiger, days, top_n, force=force)
         return {"success": True, "data": data}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取龙虎榜失败: {str(error)}")
@@ -91,9 +93,11 @@ async def get_dragon_tiger_api(days: int = SMART_MONEY_DRAGON_TIGER_DAYS, top_n:
 
 @router.get("/api/northbound", tags=["聪明钱"])
 async def get_northbound_api(force: bool = False):
-    """北向资金市场级净买额（P1b）。返回沪深股通当日/月度净买及情绪判断。force=true 时忽略缓存。"""
+    """北向资金市场级净买额（P1b）。返回沪深股通当日/月度净买及情绪判断。force=true 时忽略缓存。
+
+    2026-11-16 性能：get_northbound_market 含同步网络/DB，移入 to_thread。"""
     try:
-        data = get_northbound_market(force=force)
+        data = await asyncio.to_thread(get_northbound_market, force=force)
         return {"success": True, "data": data}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取北向资金失败: {str(error)}")
@@ -120,7 +124,7 @@ async def get_valuation_api(symbols: str = ''):
     """批量查询估值分位（P2c）。symbols 逗号分隔，留空返回空。"""
     try:
         syms = [s.lower() for s in symbols.split(',') if re.match(r'^(sh|sz)\d{6}$', s.lower())]
-        data = get_valuation_batch(syms)
+        data = await asyncio.to_thread(get_valuation_batch, syms)
         return {"success": True, "data": data}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取估值分位失败: {str(error)}")

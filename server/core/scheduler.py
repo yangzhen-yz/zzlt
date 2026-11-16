@@ -696,18 +696,12 @@ def run_scheduler(register_only: bool = False):
                 print(f'[预热 {datetime.now():%H:%M:%S}] 本地K库统计缓存完成（{_time.time() - t0:.1f}s）')
             except Exception as e:
                 print(f'[预热 {datetime.now():%H:%M:%S}] K库统计预热失败（首开会现算）: {e}')
-            # 2026-11-04 P0-A：收评 518KB 的查库+序列化+ETag 计算提前付掉。
-            # SWR 只保证「缓存有值」时不阻塞，不预热的话重启后第一个打开收评页的
-            # 用户仍要付一次 cold（实测 133ms，在 to_thread 里不堵主循环但自己要等）。
-            try:
-                t0 = _time.time()
-                _swr.swr_get(_r._DAILY_REVIEWS_CACHE, 'all',
-                             _r._build_daily_reviews_entry,
-                             ttl=_r._DAILY_REVIEWS_TTL, stale_max=_r._SWR_STALE_MAX,
-                             label='daily-reviews', gap=60, max_keys=2)
-                print(f'[预热 {datetime.now():%H:%M:%S}] 收评缓存完成（{_time.time() - t0:.1f}s）')
-            except Exception as e:
-                print(f'[预热 {datetime.now():%H:%M:%S}] 收评预热失败（首开会现算）: {e}')
+            # 2026-11-16 性能：收评预热已迁到 app/main.py lifespan 里单独提前回填。
+            # 原来放在这个 misc 段里，而 GIL 根治后一次性预热合并进 warm_rest 单个
+            # 子进程、串行整条链跑完才整体回填主进程 —— 收评本身只要 ~133ms，却要
+            # 等 vol/heavy/misc 全跑完（上次 200s），期间首开收评页现场冷算 9.39s。
+            # 改由主进程 init_db() 后直接 to_thread 算，几秒就绪、与长链解耦；
+            # 这里不再算，也就不会在子进程快照回填时覆盖主进程那份。
         except Exception as e:
             print(f'[预热 {datetime.now():%H:%M:%S}] 分钟级数据源预热整体失败（不致命）: {e}')
     _spawn_prewarm(register_only, _prewarm_misc, 'prewarm-misc')

@@ -18,7 +18,7 @@ async def scan_ma10_api():
 @router.get("/api/trend-stocks", tags=["趋势发现"])
 async def get_trend_scan_results():
     try:
-        trend_data = load_trend_scan_results()
+        trend_data = await asyncio.to_thread(load_trend_scan_results)
         trend_data = _ensure_today_date(trend_data)
         # V4.6: 为每只趋势股票注入买卖点（位置感知，trend_details 精确度最高）
         stocks = trend_data.get('stocks', [])
@@ -53,27 +53,32 @@ async def get_trend_scan_results():
 
 @router.get("/api/trend/history-counts", tags=["趋势发现"])
 async def get_trend_history_counts(days: int = 30):
-    """趋势扫描历史数量统计（市场温度计：每日扫描数/符合数，辅助判断减仓加仓时机）"""
-    try:
+    """趋势扫描历史数量统计（市场温度计：每日扫描数/符合数，辅助判断减仓加仓时机）
+
+    2026-11-16 性能：同步 SQLite 读移入 to_thread + try/finally（原来同步查询
+    压在事件循环上，异常时连接还会泄漏）。口径与返回结构不变。"""
+    def _load():
         conn = get_db_conn()
-        c = conn.cursor()
-        c.execute('''
-            SELECT
-                scan_date,
-                SUM(CASE WHEN symbol != '__SCAN_EMPTY__' THEN 1 ELSE 0 END) as result_count,
-                MIN(total_scanned) as scanned_count,
-                ROUND(AVG(CASE WHEN symbol != '__SCAN_EMPTY__' THEN score ELSE NULL END), 1) as avg_score,
-                MAX(CASE WHEN symbol != '__SCAN_EMPTY__' THEN score ELSE 0 END) as max_score,
-                SUM(CASE WHEN symbol != '__SCAN_EMPTY__' AND score >= 80 THEN 1 ELSE 0 END) as count_80plus,
-                SUM(CASE WHEN symbol != '__SCAN_EMPTY__' AND score >= 55 THEN 1 ELSE 0 END) as count_55plus
-            FROM trend_scan_results
-            WHERE scan_date IS NOT NULL AND scan_date != ''
-            GROUP BY scan_date
-            ORDER BY scan_date DESC
-            LIMIT ?
-        ''', (days * 3,))
-        rows = c.fetchall()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT
+                    scan_date,
+                    SUM(CASE WHEN symbol != '__SCAN_EMPTY__' THEN 1 ELSE 0 END) as result_count,
+                    MIN(total_scanned) as scanned_count,
+                    ROUND(AVG(CASE WHEN symbol != '__SCAN_EMPTY__' THEN score ELSE NULL END), 1) as avg_score,
+                    MAX(CASE WHEN symbol != '__SCAN_EMPTY__' THEN score ELSE 0 END) as max_score,
+                    SUM(CASE WHEN symbol != '__SCAN_EMPTY__' AND score >= 80 THEN 1 ELSE 0 END) as count_80plus,
+                    SUM(CASE WHEN symbol != '__SCAN_EMPTY__' AND score >= 55 THEN 1 ELSE 0 END) as count_55plus
+                FROM trend_scan_results
+                WHERE scan_date IS NOT NULL AND scan_date != ''
+                GROUP BY scan_date
+                ORDER BY scan_date DESC
+                LIMIT ?
+            ''', (days * 3,))
+            rows = c.fetchall()
+        finally:
+            conn.close()
         data = [{
             'date': r['scan_date'],
             'scanned': r['scanned_count'] or 0,
@@ -84,8 +89,9 @@ async def get_trend_history_counts(days: int = 30):
             'count_55plus': r['count_55plus'] or 0,
         } for r in rows]
         # 仅保留交易日（排除周末与法定节假日），再截取所需条数
-        data = [d for d in data if is_trading_day(d['date'])][:days]
-        return {"success": True, "data": data}
+        return [d for d in data if is_trading_day(d['date'])][:days]
+    try:
+        return {"success": True, "data": await asyncio.to_thread(_load)}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取趋势历史统计失败: {str(error)}")
 
@@ -117,7 +123,7 @@ async def run_trend_backtest():
 async def get_trend_backtest_history(limit: int = 30):
     """获取趋势回测历史报告列表"""
     try:
-        reports = load_trend_backtest_reports(limit=limit)
+        reports = await asyncio.to_thread(load_trend_backtest_reports, limit=limit)
         return {"success": True, "data": reports}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取回测历史失败: {str(error)}")
@@ -127,7 +133,7 @@ async def get_trend_backtest_history(limit: int = 30):
 async def get_trend_backtest_latest():
     """获取最新一条趋势回测报告（前端徽章用）"""
     try:
-        report = load_latest_trend_backtest_report()
+        report = await asyncio.to_thread(load_latest_trend_backtest_report)
         return {"success": True, "data": report}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取最新回测报告失败: {str(error)}")
@@ -137,7 +143,7 @@ async def get_trend_backtest_latest():
 async def get_trend_backtest_records(predict_date: str = None, symbol: str = None, limit: int = 100):
     """获取趋势回测明细记录（支持按日期/symbol 过滤）"""
     try:
-        records = load_trend_backtest_records(predict_date=predict_date, symbol=symbol, limit=limit)
+        records = await asyncio.to_thread(load_trend_backtest_records, predict_date=predict_date, symbol=symbol, limit=limit)
         return {"success": True, "data": records}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取回测明细失败: {str(error)}")
@@ -166,7 +172,7 @@ async def get_trend_backtest_summary(limit: int = 30):
     让"回头看自己"的闭环对前端可见、可量化。
     """
     try:
-        reports = load_trend_backtest_reports(limit=limit)
+        reports = await asyncio.to_thread(load_trend_backtest_reports, limit=limit)
         if not reports:
             return {"success": True, "data": {"hasData": False}}
         # 跨报告加权胜率（按各周期验证样本数加权）
@@ -187,18 +193,24 @@ async def get_trend_backtest_summary(limit: int = 30):
                      '5d': _wr(agg['win_5d'], agg['verified_5d'])}
 
         # 平均超额收益（个股 N 日涨跌 − 大盘 N 日涨跌），来自明细记录
-        conn = get_db_conn()
-        c = conn.cursor()
-        excess = {}
-        for p in ('1d', '3d', '5d'):
-            c.execute(
-                f'''SELECT AVG(actual_change_{p} - market_change_{p})
-                    FROM trend_backtest_records WHERE verified_{p} = 1
-                    AND actual_change_{p} IS NOT NULL AND market_change_{p} IS NOT NULL''')
-            row = c.fetchone()
-            val = row[0] if row and row[0] is not None else 0.0
-            excess[p] = round(float(val), 2)
-        conn.close()
+        # 2026-11-16 性能：3 次同步查询 + 连接移入 to_thread + try/finally。
+        def _load_excess():
+            conn = get_db_conn()
+            try:
+                c = conn.cursor()
+                _ex = {}
+                for p in ('1d', '3d', '5d'):
+                    c.execute(
+                        f'''SELECT AVG(actual_change_{p} - market_change_{p})
+                            FROM trend_backtest_records WHERE verified_{p} = 1
+                            AND actual_change_{p} IS NOT NULL AND market_change_{p} IS NOT NULL''')
+                    row = c.fetchone()
+                    val = row[0] if row and row[0] is not None else 0.0
+                    _ex[p] = round(float(val), 2)
+                return _ex
+            finally:
+                conn.close()
+        excess = await asyncio.to_thread(_load_excess)
 
         return {
             "success": True,

@@ -30,9 +30,11 @@ async def get_market_predict_api():
 
 @router.get("/api/market-alert", tags=["大盘预警"])
 async def get_market_alert_api():
-    """获取最新大盘风险预警（前端轮询用，轻量级）"""
+    """获取最新大盘风险预警（前端轮询用，轻量级）
+
+    2026-11-16 性能：同步 SQLite 读移入 to_thread，前端轮询不阻塞事件循环。"""
     try:
-        alert = load_market_alert()
+        alert = await asyncio.to_thread(load_market_alert)
         return {"success": True, "data": alert}
     except Exception as error:
         return {"success": True, "data": None}

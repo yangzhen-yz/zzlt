@@ -7,9 +7,12 @@ router = APIRouter()
 
 @router.get("/api/strategy/weights", tags=["策略管理"])
 async def get_strategy_factor_weights():
-    """获取当前策略权重和各因子准确率"""
+    """获取当前策略权重和各因子准确率
+
+    2026-11-16 性能：load_strategy_factor_weights() 是同步 SQLite 读，直接放在
+    async 路由里会阻塞事件循环。统一丢 to_thread，不阻塞其他请求。"""
     try:
-        weights = load_strategy_factor_weights()
+        weights = await asyncio.to_thread(load_strategy_factor_weights)
         result = {}
         for factor, data in weights.items():
             result[factor] = {
@@ -30,7 +33,7 @@ async def reset_strategy_factor_weights():
     try:
         weights = {k: {'weight': v, 'accuracy': 50.0, 'sample_count': 0, 'correct_count': 0}
                    for k, v in DEFAULT_WEIGHTS.items()}
-        save_strategy_factor_weights(weights)
+        await asyncio.to_thread(save_strategy_factor_weights, weights)
         return {"success": True, "message": "策略权重已重置为默认值"}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"重置策略权重失败: {str(error)}")
@@ -48,16 +51,21 @@ async def run_backtest():
 
 @router.get("/api/strategy/backtest-history", tags=["策略管理"])
 async def get_backtest_history(days: int = STRATEGY_BACKTEST_HISTORY_DAYS):
-    """获取回测历史报告"""
-    try:
+    """获取回测历史报告
+
+    2026-11-16 性能：DB 查询 + JSON 解析整体移入 to_thread（原来同步 SQLite
+    读压在事件循环上），并补 try/finally 保证异常时连接也能关闭。口径不变。"""
+    def _load():
         conn = get_db_conn()
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT * FROM strategy_backtest_reports ORDER BY backtest_date DESC LIMIT ?',
-            (days,)
-        )
-        rows = cursor.fetchall()
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT * FROM strategy_backtest_reports ORDER BY backtest_date DESC LIMIT ?',
+                (days,)
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
         # 解析 TEXT 字段
         import json
         result_rows = []
@@ -80,38 +88,45 @@ async def get_backtest_history(days: int = STRATEGY_BACKTEST_HISTORY_DAYS):
                 except Exception as _e:
                     print(f'[回测历史] weight_adjustments JSON 解析失败(id={d.get("id")}): {_e}')
             result_rows.append(d)
-        return {"success": True, "data": result_rows}
+        return result_rows
+    try:
+        return {"success": True, "data": await asyncio.to_thread(_load)}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取回测历史失败: {str(error)}")
 
 
 @router.get("/api/strategy/predictions", tags=["策略管理"])
 async def get_predictions(date_str: str = None, verified: int = None, include_today_and_pending: bool = False):
-    """获取预测记录"""
-    try:
+    """获取预测记录
+
+    2026-11-16 性能：同 backtest-history，同步 SQLite 读移入 to_thread + try/finally。"""
+    def _load():
         conn = get_db_conn()
-        cursor = conn.cursor()
-        sql = 'SELECT * FROM strategy_predict_records WHERE 1=1'
-        params = []
-        
-        if include_today_and_pending:
-            import datetime
-            today = datetime.datetime.now().strftime('%Y-%m-%d')
-            sql += ' AND (predict_date = ? OR verified = 0)'
-            params.append(today)
-        else:
-            if date_str:
-                sql += ' AND predict_date = ?'
-                params.append(date_str)
-            if verified is not None:
-                sql += ' AND verified = ?'
-                params.append(verified)
-                
-        sql += f' ORDER BY predict_date DESC, score DESC LIMIT {STRATEGY_BACKTEST_PREDICTION_LIMIT}'
-        cursor.execute(sql, params)
-        rows = cursor.fetchall()
-        conn.close()
-        return {"success": True, "data": rows}
+        try:
+            cursor = conn.cursor()
+            sql = 'SELECT * FROM strategy_predict_records WHERE 1=1'
+            params = []
+
+            if include_today_and_pending:
+                import datetime
+                today = datetime.datetime.now().strftime('%Y-%m-%d')
+                sql += ' AND (predict_date = ? OR verified = 0)'
+                params.append(today)
+            else:
+                if date_str:
+                    sql += ' AND predict_date = ?'
+                    params.append(date_str)
+                if verified is not None:
+                    sql += ' AND verified = ?'
+                    params.append(verified)
+
+            sql += f' ORDER BY predict_date DESC, score DESC LIMIT {STRATEGY_BACKTEST_PREDICTION_LIMIT}'
+            cursor.execute(sql, params)
+            return cursor.fetchall()
+        finally:
+            conn.close()
+    try:
+        return {"success": True, "data": await asyncio.to_thread(_load)}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取预测记录失败: {str(error)}")
 
@@ -121,7 +136,7 @@ async def get_optimization_history(module: str = '', limit: int = 50):
     """查询自动优化历史"""
     from db.database import load_optimization_history
     module_param = module if module else None
-    data = load_optimization_history(module=module_param, limit=limit)
+    data = await asyncio.to_thread(load_optimization_history, module=module_param, limit=limit)
     return {"success": True, "data": data}
 
 
@@ -130,7 +145,7 @@ async def get_optimization_status():
     """查询当前优化状态（D1-D4权重）
     2026-10-28 角色体系下线：不再返回 roleThresholds / rolePerformance。"""
     from db.database import load_trend_dimension_weights
-    dim_weights = load_trend_dimension_weights()
+    dim_weights = await asyncio.to_thread(load_trend_dimension_weights)
     return {
         "success": True,
         "data": {
@@ -149,43 +164,50 @@ async def trigger_optimization(run_grid: bool = False):
 
 @router.get("/api/optimization/trend", tags=["自动优化"])
 async def get_optimization_trend():
-    """优化趋势聚合数据（前端面板展示用）"""
+    """优化趋势聚合数据（前端面板展示用）
+
+    2026-11-16 性能：4 次同步 SQLite 查询整体移入 to_thread + try/finally，
+    避免 4 次同步读连续阻塞事件循环。口径与返回结构不变。"""
     from db.database import get_db_conn
-    conn = get_db_conn()
-    cursor = conn.cursor()
+    def _load():
+        conn = get_db_conn()
+        try:
+            cursor = conn.cursor()
 
-    # 1. 权重变化趋势（按天聚合 optimization_history 中 trend_dimension_weights 模块）
-    cursor.execute('''
-        SELECT created_at, parameter_set, metric_value, details
-        FROM optimization_history
-        WHERE module = 'trend_dimension_weights'
-        ORDER BY created_at DESC LIMIT 60
-    ''')
-    weight_history = [dict(r) for r in cursor.fetchall()]
+            # 1. 权重变化趋势（按天聚合 optimization_history 中 trend_dimension_weights 模块）
+            cursor.execute('''
+                SELECT created_at, parameter_set, metric_value, details
+                FROM optimization_history
+                WHERE module = 'trend_dimension_weights'
+                ORDER BY created_at DESC LIMIT 60
+            ''')
+            weight_history = [dict(r) for r in cursor.fetchall()]
 
-    # 2. 网格搜索结果历史（2026-10-28 删掉"角色近期表现"：角色体系已下线）
-    cursor.execute('''
-        SELECT created_at, metric_value as best_winrate,
-               old_value as current_winrate,
-               new_value - old_value as improvement,
-               parameter_set
-        FROM optimization_history
-        WHERE module = 'grid_search'
-        ORDER BY created_at DESC LIMIT 10
-    ''')
-    grid_history = [dict(r) for r in cursor.fetchall()]
+            # 2. 网格搜索结果历史（2026-10-28 删掉"角色近期表现"：角色体系已下线）
+            cursor.execute('''
+                SELECT created_at, metric_value as best_winrate,
+                       old_value as current_winrate,
+                       new_value - old_value as improvement,
+                       parameter_set
+                FROM optimization_history
+                WHERE module = 'grid_search'
+                ORDER BY created_at DESC LIMIT 10
+            ''')
+            grid_history = [dict(r) for r in cursor.fetchall()]
 
-    # 3. 全量优化统计
-    cursor.execute('SELECT count(*) as cnt FROM optimization_history')
-    total_opt = cursor.fetchone()['cnt']
+            # 3. 全量优化统计
+            cursor.execute('SELECT count(*) as cnt FROM optimization_history')
+            total_opt = cursor.fetchone()['cnt']
 
-    cursor.execute('''
-        SELECT count(*) as cnt FROM optimization_history
-        WHERE created_at >= date('now', '-7 days')
-    ''')
-    week_opt = cursor.fetchone()['cnt']
-
-    conn.close()
+            cursor.execute('''
+                SELECT count(*) as cnt FROM optimization_history
+                WHERE created_at >= date('now', '-7 days')
+            ''')
+            week_opt = cursor.fetchone()['cnt']
+            return weight_history, grid_history, total_opt, week_opt
+        finally:
+            conn.close()
+    weight_history, grid_history, total_opt, week_opt = await asyncio.to_thread(_load)
 
     return {
         "success": True,

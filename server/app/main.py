@@ -185,6 +185,38 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f'[初始化] to_thread 线程池扩容失败（沿用默认池）: {e}')
     init_db()
+    # 2026-11-16 性能·收评缓存提前回填：原来收评缓存是在 core/scheduler.py 的
+    # `_prewarm_misc` 段里算的，而 GIL 根治后一次性预热合并进 `warm_rest` 单个
+    # 子进程、串行跑完整条链才整体 pickle 回填主进程。收评段本身只要 ~133ms，
+    # 却要等 vol(93s)/heavy/misc 全跑完（上次 200s）主进程才拿到 ⇒ 那段时间首开
+    # 收评页要现场冷算，实测 9.39s（回填后仅 72~179ms）。这里改由主进程在
+    # init_db() 之后直接用 to_thread 单独算一次：纯本地查库+序列化+gzip，不占
+    # 事件循环；几秒内就绪，与子进程长链解耦。子进程那侧已把收评段从 misc 摘掉，
+    # 不会碰 _DAILY_REVIEWS_CACHE，回填时也不会覆盖主进程这一份。
+    try:
+        from app.api import routes as _routes_for_review
+        from services.support import swr as _swr_for_review
+
+        def _prewarm_daily_reviews_early():
+            _swr_for_review.swr_get(
+                _routes_for_review._DAILY_REVIEWS_CACHE, 'all',
+                _routes_for_review._build_daily_reviews_entry,
+                ttl=_routes_for_review._DAILY_REVIEWS_TTL,
+                stale_max=_routes_for_review._SWR_STALE_MAX,
+                label='daily-reviews', gap=60, max_keys=2)
+
+        async def _bg_prewarm_review():
+            _t0 = time.perf_counter()
+            try:
+                await asyncio.to_thread(_prewarm_daily_reviews_early)
+                print(f'[初始化] 收评缓存提前回填完成（{(time.perf_counter() - _t0) * 1000:.0f}ms）')
+            except Exception as _e:
+                print(f'[初始化] 收评缓存提前回填失败（首开会现算兜底）: '
+                      f'{type(_e).__name__}: {_e}')
+
+        asyncio.create_task(_bg_prewarm_review())
+    except Exception as _e:
+        print(f'[初始化] 收评提前回填任务未起（不影响启动）: {type(_e).__name__}: {_e}')
     # 接口用量统计：在 scheduler 启动前接管所有出站 HTTP（requests/httpx/urllib），
     # 这样首屏热搜榜拉取、盘后同步等全部被计入，避免遗漏。失败不影响主流程。
     try:

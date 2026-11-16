@@ -40,14 +40,18 @@ async def get_stock_analysis(symbol: str):
             raise HTTPException(status_code=502, detail="行情数据解析失败")
         stock_data = parsed_list[0]
         # 10 因子评分（V2 权威评分，权重由后端统一维护）
-        # : 从 DB 缓存查股东人数（月度数据，无需实时拉取）
+        # 2026-11-16 性能：holder/fundamental 是同步 SQLite 读，与 rps 一起并发拉取，
+        # 统一不压事件循环（与 /full 接口 L176-182 同口径）。
         from services.data.shareholder import get_holder_num_batch
-        holder_map = get_holder_num_batch([sym])
+        holder_map, fd_map, rps_map = await asyncio.gather(
+            asyncio.to_thread(get_holder_num_batch, [sym]),
+            asyncio.to_thread(get_fundamental_batch, [sym]),
+            get_rps_map(),
+        )
         hd = holder_map.get(sym)
-        rps_map = await get_rps_map()
         rps = rps_map.get(normalize_local_symbol(sym))
         # P1a/P1b: 基本面质量 + 聪明钱(龙虎榜)注入
-        fd = get_fundamental_batch([sym]).get(sym)
+        fd = fd_map.get(sym)
         dt_map = await asyncio.to_thread(get_dragon_tiger_symbol_map, SMART_MONEY_DRAGON_TIGER_DAYS)
         sm = dt_map.get(sym)
         sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
@@ -58,8 +62,8 @@ async def get_stock_analysis(symbol: str):
         result = calc_stock_score_v2(stock_data, holder_data=hd, rps_data={'rps': rps},
                                      fundamental_data=fd, smart_money_data=sm_data,
                                      trend_result=tr)
-        # P2c/P2a: 估值分位 + 风控止损
-        val = get_valuation_batch([sym]).get(sym)
+        # P2c/P2a: 估值分位 + 风控止损（2026-11-16：同步 DB 读移入 to_thread）
+        val = (await asyncio.to_thread(get_valuation_batch, [sym])).get(sym)
         _holder_ratio = (hd or {}).get('total_num_ratio')
         risk_control = calc_risk_control(stock_data.get('price', 0), score_result=result,
                                          stock=stock_data, valuation=val,
@@ -202,9 +206,12 @@ async def get_stock_full(symbol: str, force: bool = False, response: Response = 
             # 只在完整路径写缓存：降级结果不占 3s 缓存，下一次轮询立即重算补齐
             if not _timed_out:
                 _analysis_cache[sym] = (now, raw, result, rps, fd, sm_data, val, risk_control)
-                # 清理过期缓存（懒惰清理，超过 100 条时）
+                # 2026-11-16 性能：原来 >100 条就 clear() 全清，导致 100 只票后
+                # 所有缓存瞬间失效、下一轮全部冷算。改为只淘汰最旧的 30 条
+                # （条目第一个元素是写入时间戳），保留最近使用的 70 条。
                 if len(_analysis_cache) > 100:
-                    _analysis_cache.clear()
+                    for _old in sorted(_analysis_cache, key=lambda k: _analysis_cache[k][0])[:30]:
+                        _analysis_cache.pop(_old, None)
 
         base_scores = result.get('base_scores', {})
         details = []
@@ -285,13 +292,20 @@ async def search_stocks_api(q: str = ''):
     if not q:
         return {"success": True, "data": []}
     try:
-        basic = load_stock_basic_info()        # {symbol: name}
-        alias = load_stock_alias_map()         # {name: symbol}
+        # 2026-11-16 性能：开头 4 次同步 SQLite 读（basic/alias/热股/扫描池）
+        # 整体移入 to_thread，避免搜索时连续同步读压在事件循环上。
+        def _load_index():
+            _basic = load_stock_basic_info()   # {symbol: name}
+            _alias = load_stock_alias_map()    # {name: symbol}
+            _hot = load_hot_stock_buttons()
+            _pool = load_user_scan_pool()
+            return _basic, _alias, _hot, _pool
+        basic, alias, hot_buttons, scan_pool = await asyncio.to_thread(_load_index)
         extra = {}                             # symbol -> name（热股/扫描池补充）
-        for b in load_hot_stock_buttons():
+        for b in hot_buttons:
             if b.get('code'):
                 extra[b['code'].lower()] = b.get('name') or ''
-        for s in load_user_scan_pool():
+        for s in scan_pool:
             extra.setdefault(s.lower(), basic.get(s.lower(), ''))
         for name, sym in alias.items():
             extra.setdefault(sym.lower(), name)

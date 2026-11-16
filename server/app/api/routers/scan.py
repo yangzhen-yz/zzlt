@@ -333,34 +333,40 @@ async def hot_stock_buttons_scan(codes: str = '', force: bool = False, pool_only
             scan_weights = None
         try:
             from services.strategy.trend import load_trend_scan_results
-            _scan_trend = load_trend_scan_results().get('stocks', [])
+            _scan_trend = (await asyncio.to_thread(load_trend_scan_results)).get('stocks', [])
             scan_trend_map = {s['symbol'].lower(): {'score': s.get('score'), 'details': s.get('details', {})}
                               for s in _scan_trend if s.get('symbol') is not None}
         except Exception as _e:
             print(f'[批量扫描] 趋势分缓存加载失败(按无趋势评分): {_e}')
             scan_trend_map = {}
-        for stock in all_results:
-            sym = stock.get('symbol', '').lower()
-            ff = fund_flow_map.get(sym)
-            hd = holder_map.get(sym)
-            rps = rps_map.get(normalize_local_symbol(sym))
-            fd = fund_map.get(sym)
-            sm = sm_map.get(sym)
-            val = val_map.get(sym)
-            sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
-                       'appearances': (sm or {}).get('appearances', 0)} if sm else None
-            stock['score'] = calc_stock_score_v2(stock, weights=scan_weights,
-                                                  market_change=market_change,
-                                                  fund_flow_data=ff, holder_data=hd,
-                                                  rps_data={'rps': rps},
-                                                  fundamental_data=fd, smart_money_data=sm_data,
-                                                  trend_result=scan_trend_map.get(sym))
-            # P2a/P2c: 风控止损 + 估值分位（纯函数，无额外 IO）
-            _holder_ratio = (hd or {}).get('total_num_ratio')
-            stock['valuation'] = val
-            stock['riskControl'] = calc_risk_control(
-                stock.get('price', 0), score_result=stock['score'],
-                stock=stock, valuation=val, smart_money=sm_data, holder_ratio=_holder_ratio)
+        # 2026-11-16 性能：120 只票的评分是纯 CPU 循环（weights 已在 L330 预取、
+        # calc_stock_score_v2/calc_risk_control 均为纯函数无 IO），原来直接在 async
+        # handler 里跑占用事件循环、拖慢同期的 30s 轮询。整体移入 to_thread。
+        # 只包评分循环本身——行业中性化（要改 all_results）与其后的 await 持久化留外面。
+        def _score_all():
+            for stock in all_results:
+                sym = stock.get('symbol', '').lower()
+                ff = fund_flow_map.get(sym)
+                hd = holder_map.get(sym)
+                rps = rps_map.get(normalize_local_symbol(sym))
+                fd = fund_map.get(sym)
+                sm = sm_map.get(sym)
+                val = val_map.get(sym)
+                sm_data = {'on_board': True, 'net_amt': (sm or {}).get('net_amt', 0),
+                           'appearances': (sm or {}).get('appearances', 0)} if sm else None
+                stock['score'] = calc_stock_score_v2(stock, weights=scan_weights,
+                                                      market_change=market_change,
+                                                      fund_flow_data=ff, holder_data=hd,
+                                                      rps_data={'rps': rps},
+                                                      fundamental_data=fd, smart_money_data=sm_data,
+                                                      trend_result=scan_trend_map.get(sym))
+                # P2a/P2c: 风控止损 + 估值分位（纯函数，无额外 IO）
+                _holder_ratio = (hd or {}).get('total_num_ratio')
+                stock['valuation'] = val
+                stock['riskControl'] = calc_risk_control(
+                    stock.get('price', 0), score_result=stock['score'],
+                    stock=stock, valuation=val, smart_money=sm_data, holder_ratio=_holder_ratio)
+        await asyncio.to_thread(_score_all)
 
         # 行业中性化：按行业 P20/P80 分位数调整 strategy_score.total
         # industry_map 来自 fetch_batch_fund_flow 的 f100 字段；样本<5/行业跳过

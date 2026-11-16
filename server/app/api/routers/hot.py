@@ -7,8 +7,9 @@ router = APIRouter()
 
 @router.get("/api/hot_search_ranking", tags=["热搜榜数据"])
 async def get_hot_search_ranking_api():
+    # 2026-11-16 性能：同步 SQLite 读移入 to_thread，符合全站"DB 读不压事件循环"口径。
     try:
-        data = load_hot_search_ranking()
+        data = await asyncio.to_thread(load_hot_search_ranking)
         return {"success": True, "data": data}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"获取hot_search_ranking失败: {str(error)}")
@@ -33,7 +34,7 @@ async def update_hot_search_ranking_api():
 @router.get("/api/hot-stocks", tags=["热门股票"])
 async def get_hot_stock_buttons_api(user: Dict = Depends(current_user)):
     try:
-        stocks = load_hot_stock_buttons(user_id=int(user.get('id') or 1))
+        stocks = await asyncio.to_thread(load_hot_stock_buttons, user_id=int(user.get('id') or 1))
         # 获取实时价格用于排序
         if stocks:
             try:
