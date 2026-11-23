@@ -79,8 +79,14 @@ def main() -> int:
         # 盘前 9:00 → 9:15 只有 900s，不能一路缓存到收盘
         t0900 = Q.static_ttl(dt.datetime(2026, 11, 13, 9, 0))
         check('盘前 TTL 精确到 9:15（900s）', abs(t0900 - 900) < 2, f'{t0900}')
-        check('TTL 封顶 6 小时', Q.static_ttl(dt.datetime(2026, 11, 15, 13, 29))
-              <= Q.MAX_TTL_SEC)
+        # 2026-11-21：原「封顶 6h」会让周末夜间固定过期一次、穿透到新浪慢兜底。
+        # 新语义 = 覆盖到下次开盘（周六 13:29 → 周一 9:15 约 44h > 6h）。
+        _weekend_ttl = Q.static_ttl(dt.datetime(2026, 11, 14, 13, 29))
+        check('周末 TTL 覆盖整段静态窗口（>6h，不再夜间穿透）',
+              _weekend_ttl > 6 * 3600, f'{_weekend_ttl}')
+        check('周末 TTL 不超安全上限', _weekend_ttl <= Q.MAX_TTL_SEC)
+        check('TTL 封顶只在超长假期生效（<=72h）',
+              Q.static_ttl(dt.datetime(2026, 11, 15, 13, 29)) <= Q.MAX_TTL_SEC)
         check('盘中 TTL=0', Q.static_ttl(dt.datetime(2026, 11, 13, 10, 0)) == 0.0)
 
         # ---------- 2. 基本命中 / force / 完整响应校验 ----------

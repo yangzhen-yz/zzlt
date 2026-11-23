@@ -132,8 +132,10 @@ async def main() -> int:
               str(W.cache_ttl(dt.datetime(2026, 11, 13, 20, 0))))
         check('周日给长 TTL',
               W.cache_ttl(dt.datetime(2026, 11, 15, 14, 52)) > 60)
-        check('TTL 封顶 6 小时', W.cache_ttl(dt.datetime(2026, 11, 15, 14, 52))
-              <= W.MAX_TTL_SEC)
+        # 2026-11-21：6h 封顶已去掉，周末 TTL 覆盖到周一开盘（约 18h），不再夜间穿透
+        _sun_ttl = W.cache_ttl(dt.datetime(2026, 11, 15, 14, 52))
+        check('周日响应缓存覆盖整段静态窗口（>6h）', _sun_ttl > 6 * 3600, f'{_sun_ttl}')
+        check('响应缓存 TTL 不超安全上限', _sun_ttl <= W.MAX_TTL_SEC)
         check('单票 static_ttl 不受盘后短 TTL 影响（收盘价已定格）',
               Q.static_ttl(dt.datetime(2026, 11, 13, 15, 30)) > 60)
         check('窗口判定共用同一份实现',
