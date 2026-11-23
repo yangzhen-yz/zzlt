@@ -165,12 +165,16 @@ def hot_scan_key(codes_list) -> str:
 
 
 def _remember_hot_scan(key: str, data, ts: float) -> None:
-    """写入前回收 + 按 `used` 淘汰（见上面注释）。"""
-    for k in [k for k, v in _HOT_SCAN_CACHE.items() if ts - v['ts'] >= _HOT_SCAN_STALE_MAX]:
-        _HOT_SCAN_CACHE.pop(k, None)
-    while len(_HOT_SCAN_CACHE) >= _HOT_SCAN_MAX_KEYS:
-        least = min(_HOT_SCAN_CACHE,
-                    key=lambda k: _HOT_SCAN_CACHE[k].get('used', _HOT_SCAN_CACHE[k]['ts']))
+    """写入前回收 + 按 `used` 淘汰（见上面注释）。
+
+    与 `_remember_rec_review` 同规：一律经 `_swr.data_items` 排除失效代数表
+    `__swr_gen__`（11-18 复盘接口 KeyError 的同源写法，今天只是还没被踩）。"""
+    for k, v in _swr.data_items(_HOT_SCAN_CACHE):
+        if ts - (v.get('ts') or 0) >= _HOT_SCAN_STALE_MAX:
+            _HOT_SCAN_CACHE.pop(k, None)
+    while len(_swr.data_items(_HOT_SCAN_CACHE)) >= _HOT_SCAN_MAX_KEYS:
+        least = min(_swr.data_items(_HOT_SCAN_CACHE),
+                    key=lambda kv: kv[1].get('used') or kv[1].get('ts') or 0)[0]
         _HOT_SCAN_CACHE.pop(least, None)
     _HOT_SCAN_CACHE[key] = {'ts': ts, 'used': ts, 'data': data}
 
@@ -541,11 +545,16 @@ def _remember_rec_review(key: int, data, ts: float) -> None:
     回到"每次现算"；`ts` 还要留着算 cachedAgeSec，所以两个时间戳各管各的。"""
     # 2026-11-04：SWR 下「过期」不再等于「作废」，旧值还要服役到 stale_max，
     # 所以这里只能清真正超过服役上限的条目，否则会把自己刚返回的缓存删掉。
-    for k in [k for k, v in _REC_REVIEW_CACHE.items() if ts - v['ts'] >= _SWR_STALE_MAX]:
-        _REC_REVIEW_CACHE.pop(k, None)
-    while len(_REC_REVIEW_CACHE) >= _REC_REVIEW_MAX_KEYS:
-        least_used = min(_REC_REVIEW_CACHE,
-                         key=lambda k: _REC_REVIEW_CACHE[k].get('used', _REC_REVIEW_CACHE[k]['ts']))
+    # 2026-11-18：一律经 `_swr.data_items`（排除 `__swr_gen__` 代数表）。重活子进程
+    # 跑完推荐类 job 后 `heavy_tasks.after_job()` 会 `swr.invalidate(_REC_REVIEW_CACHE)`，
+    # 那张表被写进同一个 dict；老写法下一笔请求在这里取 `v['ts']` → KeyError →
+    # 本接口 500 且必现（当日实测 14 次，两批批次之间只能靠重启恢复）。
+    for k, v in _swr.data_items(_REC_REVIEW_CACHE):
+        if ts - (v.get('ts') or 0) >= _SWR_STALE_MAX:
+            _REC_REVIEW_CACHE.pop(k, None)
+    while len(_swr.data_items(_REC_REVIEW_CACHE)) >= _REC_REVIEW_MAX_KEYS:
+        least_used = min(_swr.data_items(_REC_REVIEW_CACHE),
+                         key=lambda kv: kv[1].get('used') or kv[1].get('ts') or 0)[0]
         _REC_REVIEW_CACHE.pop(least_used, None)
     _REC_REVIEW_CACHE[key] = {'ts': ts, 'used': ts, 'data': data}
 

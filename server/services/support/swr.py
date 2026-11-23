@@ -78,6 +78,19 @@ def invalidate(store: Dict, keys: Optional[Iterable[Any]] = None) -> None:
         store.pop(k, None)
 
 
+def data_items(store: Dict) -> list:
+    """store 里的真实缓存条目（排除失效代数表 `_GEN_KEY`）。
+
+    2026-11-18：`invalidate()` 会把代数表**写进同一个 store**，而 routes_state 里
+    手写的 `_remember_*`（复盘汇总、批量扫描）直接遍历整张表取 `v['ts']` ——
+    重活子进程跑完推荐类 job 后 `after_job()` 调 `invalidate(store)`，下一笔
+    请求写缓存就 `KeyError: 'ts'` → `/api/recommend-review` 永久 500（当日实测 14 次）。
+    手写淘汰逻辑一律用这个函数数数与排序，与 `put()` 的口径保持一致。
+    """
+    return [(k, v) for k, v in store.items()
+            if k != _GEN_KEY and isinstance(v, dict)]
+
+
 def _cache_key(label: str, key: Any) -> str:
     return f'{label}:{key!r}'
 
