@@ -124,9 +124,15 @@ async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
 
 @router.get("/api/recommend-batches", tags=["推荐记录"])
 async def recommend_batches_api(date: str = ''):
-    """当日各批次推荐回看（2026-10-21）：daily_recommendations 先删后插只留末批，
-    上午推过什么（如 10-21 的 10:26 上工申贝）只有 strategy_snapshot 记得。
-    按批次返回推荐档名单＋批次现场（周期/情绪分），供智能推荐页折叠区展示。"""
+    """当日各批次推荐回看（2026-10-21，2026-11-16 改主数据源）。
+
+    原来只读 strategy_snapshot 的 stage='recommended'——那是**扫描层**的推荐档快照。
+    11-01 起每批推荐都另存一行到 recommendation_batches（只追加），那才是"当天到底
+    生成过哪几批、每批具体是哪几只票"的权威来源（含空仓哨兵批次）。11-16 起主表还
+    改成保留"当日评分最高的一批"而不是最后一批，所以这里额外回传：
+      · `active` —— 该批是否就是主表当前展示的那批（按 daily_recommendations.batch_ref 认）；
+      · `cash`   —— 该批是空仓哨兵（不是故障，是正式风控输出）。
+    11-01 之前的日期没有批次表，退回快照回看，字段口径不变。"""
     from datetime import datetime as _dt
     d = date or _dt.now().strftime('%Y-%m-%d')
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
@@ -135,20 +141,84 @@ async def recommend_batches_api(date: str = ''):
     def _read():
         from db.database import get_db_conn
         conn = get_db_conn()
+        # 批次现场（周期/情绪分）：两个数据源共用，按 'HH:MM' 对齐
+        m = {}
+        try:
+            for x in conn.execute(
+                    "SELECT batch, cycle, cycle_score, recommended, market_change "
+                    "FROM strategy_snapshot_batch WHERE snap_date=? ORDER BY batch", (d,)).fetchall():
+                m[x['batch']] = dict(x)
+        except Exception:
+            m = {}
+        # 主表现用批次（最优保护后不一定是最后一批）
+        active_ref = None
+        try:
+            _r = conn.execute(
+                'SELECT batch_ref FROM daily_recommendations WHERE rec_date=? '
+                'AND batch_ref IS NOT NULL ORDER BY sort_order LIMIT 1', (d,)).fetchone()
+            active_ref = _r[0] if _r else None
+        except Exception:
+            active_ref = None
+        # ① 首选：真实落库批次（11-01 起只追加，被最优保护跳过的那批也在这里）
+        rb = []
+        try:
+            rb = conn.execute(
+                'SELECT id, batch_time, source, stocks_json FROM recommendation_batches '
+                'WHERE rec_date=? ORDER BY id', (d,)).fetchall()
+        except Exception:
+            rb = []
+        if rb:
+            # 落库批次里 buyTiming 是结构化对象（不进这一行），timing 徽章从快照按
+            # (批次分钟, 代码) 补齐——补不到就留空，不编。
+            snap = {}
+            try:
+                for x in conn.execute(
+                        "SELECT batch, symbol, timing, mode, rank FROM strategy_snapshot "
+                        "WHERE snap_date=? AND stage='recommended'", (d,)).fetchall():
+                    snap[(x['batch'], x['symbol'])] = dict(x)
+            except Exception:
+                snap = {}
+            out = []
+            for r in rb:
+                try:
+                    stocks = json.loads(r['stocks_json'] or '[]')
+                except Exception:
+                    stocks = []
+                bt = r['batch_time'] or ''
+                rows = []
+                for s in stocks:
+                    bsp = s.get('buySellPoints') or {}
+                    timing = bsp.get('buyTiming')
+                    if not isinstance(timing, str):
+                        timing = ''
+                    _sn = snap.get((bt[:5], s.get('symbol', ''))) or {}
+                    rows.append({'symbol': s.get('symbol', ''), 'name': s.get('name', ''),
+                                 'rank': _sn.get('rank') or len(rows) + 1,
+                                 'score': s.get('score'),
+                                 'timing': timing or (_sn.get('timing') or ''),
+                                 'mode': (s.get('mode') or '') or (_sn.get('mode') or ''),
+                                 'price': s.get('price'), 'change_percent': s.get('changePercent'),
+                                 'isCash': bool(s.get('isCash'))})
+                out.append({'batch': bt[:5] or bt, 'batchTime': bt, 'batchId': r['id'],
+                            'meta': m.get(bt[:5]) or {}, 'stocks': rows,
+                            'source': r['source'] or '',
+                            'active': active_ref is not None and r['id'] == active_ref,
+                            'cash': bool(rows) and all(x['isCash'] for x in rows),
+                            'from': 'db'})
+            return out
+        # ② 退路：11-01 之前只有快照
         rows = conn.execute(
             "SELECT batch, symbol, name, rank, score, timing, mode, price, change_percent "
             "FROM strategy_snapshot WHERE snap_date=? AND stage='recommended' ORDER BY batch, rank",
             (d,)).fetchall()
-        meta = conn.execute(
-            "SELECT batch, cycle, cycle_score, recommended, market_change "
-            "FROM strategy_snapshot_batch WHERE snap_date=? ORDER BY batch", (d,)).fetchall()
-        m = {x['batch']: dict(x) for x in meta}
         groups = {}
         for r in rows:
             g = groups.setdefault(r['batch'], [])
             g.append({k: r[k] for k in ('symbol', 'name', 'rank', 'score',
                                         'timing', 'mode', 'price', 'change_percent')})
-        return [{'batch': b, 'meta': m.get(b) or {}, 'stocks': groups.get(b, [])}
+        return [{'batch': b, 'batchTime': b, 'batchId': None, 'meta': m.get(b) or {},
+                 'stocks': groups.get(b, []), 'source': '', 'active': False,
+                 'cash': False, 'from': 'snapshot'}
                 for b in sorted(set(groups) | set(m))]
     try:
         batches = await asyncio.to_thread(_read)

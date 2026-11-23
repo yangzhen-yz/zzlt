@@ -109,13 +109,29 @@ def load_recommendation_group(rec_date: str = None) -> Dict:
 
 
 def save_daily_recommendations(daily_recommendations: List[Dict],
-                               batch_time: str = '', source: str = '') -> bool:
+                               batch_time: str = '', source: str = '',
+                               keep_best: bool = False) -> bool:
     """保存推荐（当日行覆盖）**并把这一批另存进 recommendation_batches**。
 
     2026-11-01：原来每批都是 DELETE+INSERT 覆盖当天，09:45/10:00/13:30/14:05 四批
     在库里留不下任何痕迹（10-31 实测 241 行的 created_at 全是 14:45:10）。批次表只追加，
     内容指纹与"该日最后一批"相同的就不再重复记（历史日期每次都会被重新 save 一遍，
     不比对的话每天会凭空多出 30 份重复批次）。
+
+    `keep_best`（2026-11-16，默认 False＝保持原"后批覆盖"行为）：
+    仅**自动生成推荐**的两处调用点传 True，语义是「当日主表保留评分最高的那一批，
+    而不是无条件保留最后生成的批次」。起因：11-16 上午四批都是九阳股份（评分 60→63），
+    14:45 收盘前批换成华数传媒（60）把更优的早批覆盖了，用户只看到最后一批。
+    比较口径＝批次内**最高 score**（空仓哨兵 isCash 不参与）；边界四条：
+      · 新批是空仓哨兵 → 始终覆盖（风控决策优先，不能被早盘有票压住）；
+      · 库里是空仓、新批有票 → 覆盖（市场转好，有票优于空仓）；
+      · 新批分数更低 → 保留已有，本批只留痕；
+      · 分数打平且**票池不同** → 保留已有（先到先得）。评分模型认为两者等价时，
+        "换股"没有任何依据，只会制造"上午看的是 A、收盘变 B"的困惑——正是要修的毛病。
+        打平且票池相同（同一批票被重新打分/刷新报价）→ 照常覆盖，纯粹为刷新价格，
+        不刷新的话主表价格会冻在早盘那一批上。
+    被保护跳过的那一批**仍然写进 recommendation_batches**，前端可全批次回看。
+    手工编辑（POST /api/daily_recommendations）与删除接口不传此参，行为不变。
     """
     try:
         if len(daily_recommendations) > QUERY_DAILY_RECOMMENDATIONS_LIMIT:
@@ -148,6 +164,59 @@ def save_daily_recommendations(daily_recommendations: List[Dict],
                 # 批次表写失败不能挡住当日推荐本身（它是复盘用的旁证，不是主数据）
                 print(f'[推荐批次] 留痕失败（不影响保存）: {type(_e).__name__}: {_e}')
                 batch_ref = None
+            # ── 最优批次保护（2026-11-16，仅 keep_best=True 的自动生成路径启用）──
+            # 批次留痕已写入（上面那步），这里只决定主表要不要被本批替换。
+            if keep_best:
+                try:
+                    _new_scores = []
+                    _new_syms = set()
+                    for _r in recs:
+                        if _r.get('isCash'):
+                            continue          # 空仓哨兵不参与评分比较
+                        _new_syms.add(str(_r.get('symbol') or ''))
+                        try:
+                            _new_scores.append(float(_r.get('score') or 0))
+                        except (TypeError, ValueError):
+                            pass
+                    _new_max = max(_new_scores) if _new_scores else 0.0
+                    _new_all_cash = bool(recs) and all(_r.get('isCash') for _r in recs)
+                    _prev_rows = cursor.execute(
+                        'SELECT symbol, score FROM daily_recommendations '
+                        'WHERE rec_date=? ORDER BY sort_order', (rec_date,)).fetchall()
+                    _prev_syms = {str(r[0]) for r in _prev_rows
+                                  if r[0] and str(r[0]).upper() != 'CASH'}
+                    _prev_scores = []
+                    for _r in _prev_rows:
+                        if not _r[0] or str(_r[0]).upper() == 'CASH':
+                            continue
+                        try:
+                            _prev_scores.append(float(_r[1] or 0))
+                        except (TypeError, ValueError):
+                            pass
+                    _prev_max = max(_prev_scores) if _prev_scores else None
+                    _prev_has_cash = any(str(r[0] or '').upper() == 'CASH'
+                                         for r in _prev_rows)
+                    if _prev_max is not None:
+                        if _new_all_cash:
+                            pass              # 空仓批次＝风控决策，始终覆盖
+                        elif _prev_has_cash:
+                            pass              # 库里空仓、新批有票 → 覆盖（市场转好）
+                        elif _new_max < _prev_max:
+                            # 已有更高分批次：主表保留那一批，本批只留痕，不覆盖
+                            print(f'[推荐批次] {rec_date} 本批最高 {_new_max:.0f} 分 < '
+                                  f'已有 {_prev_max:.0f} 分，主表保留更优批次（本批仅留痕）')
+                            continue
+                        elif _new_max == _prev_max and _new_syms != _prev_syms:
+                            # 打平但换票：模型认为等价，换股没有依据，先到先得
+                            print(f'[推荐批次] {rec_date} 本批 {_new_max:.0f} 分与已有打平但'
+                                  f'票池不同（{sorted(_new_syms)} ≠ {sorted(_prev_syms)}），'
+                                  f'主表保留先到批次（本批仅留痕）')
+                            continue
+                        # 打平且票池相同 → 落到下面正常覆盖，只为刷新报价/买入时机
+                except Exception as _e:
+                    # 判断失败不能让推荐保存失败，回退为原来的"直接覆盖"
+                    print(f'[推荐批次] 最优保护判断失败（回退为直接覆盖）: '
+                          f'{type(_e).__name__}: {_e}')
             # 删除该日期旧数据
             cursor.execute('DELETE FROM daily_recommendations WHERE rec_date = ?', (rec_date,))
             for sort_order, rec in enumerate(recs):

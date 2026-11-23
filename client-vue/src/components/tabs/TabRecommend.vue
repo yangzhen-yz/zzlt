@@ -95,27 +95,39 @@
         <div class="section-subtitle-small">今日推荐股票</div>
         <span class="section-stats">{{ todayDate }}</span>
       </div>
-      <!-- 当日批次折叠区（2026-10-21）：推荐表先删后插只留末批，各批次名单从 strategy_snapshot 回看 -->
+      <!-- 当日批次折叠区（2026-10-21，2026-11-16 改口径）：主表只留"当时可见最优"那一批，
+           其余批次仍在 recommendation_batches 里，这里全批次回看，并标出哪批进了主表 -->
       <div v-if="dayBatches.length" class="batch-fold">
         <div class="batch-fold-h" @click="batchOpen = !batchOpen">
-          <span class="batch-fold-t">当日批次（快照回看）</span>
+          <span class="batch-fold-t">当日批次（{{ dayBatches.length }} 批 · 主表留最优）</span>
           <span class="batch-sum">{{ batchSummary }}</span>
           <span class="batch-arrow">{{ batchOpen ? '▾' : '▸' }}</span>
         </div>
         <div v-if="batchOpen" class="batch-body">
-          <div v-for="g in dayBatches" :key="g.batch" class="batch-group">
+          <div
+            v-for="g in dayBatches"
+            :key="g.batchTime || g.batch"
+            class="batch-group"
+            :class="{ 'batch-group-active': g.active }"
+          >
             <div class="batch-g-h">
-              <b>{{ g.batch }}</b>
+              <b>{{ g.batchTime || g.batch }}</b>
+              <span v-if="g.active" class="batch-tag batch-tag-active">主表当前</span>
+              <span v-else-if="g.from === 'db'" class="batch-tag">仅留痕</span>
+              <span v-if="g.cash" class="batch-tag batch-tag-cash">空仓</span>
               <span v-if="g.meta.cycle" class="batch-cycle">{{ g.meta.cycle }} {{ g.meta.cycle_score || '' }}分</span>
               <span v-if="!g.stocks.length" class="batch-none">本批无推荐档</span>
             </div>
             <div v-for="s in g.stocks" :key="s.symbol" class="batch-row">
               <b>{{ s.name }}</b>
-              <span class="batch-timing">{{ s.timing }}</span>
-              <span class="batch-score">{{ s.score != null ? s.score + '分' : '' }}</span>
-              <span :style="{ color: (s.change_percent ?? 0) >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }">
-                {{ (s.change_percent ?? 0) >= 0 ? '+' : '' }}{{ s.change_percent }}%
-              </span>
+              <span v-if="s.isCash" class="batch-cash">空仓观望</span>
+              <template v-else>
+                <span class="batch-timing">{{ s.timing }}</span>
+                <span class="batch-score">{{ s.score != null ? s.score + '分' : '' }}</span>
+                <span :style="{ color: (s.change_percent ?? 0) >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }">
+                  {{ (s.change_percent ?? 0) >= 0 ? '+' : '' }}{{ s.change_percent }}%
+                </span>
+              </template>
             </div>
           </div>
         </div>
@@ -428,13 +440,23 @@
   const cashItem = computed(() => todayRecommend.value.find(r => r && r.isCash) || null)
   const visibleRecommend = computed(() => todayRecommend.value.filter(r => r && !r.isCash))
 
-  // 当日批次折叠区（2026-10-21）：数据来自 /api/recommend-batches（strategy_snapshot 按批次）
+  // 当日批次折叠区（2026-10-21，2026-11-16 改口径）：数据来自 /api/recommend-batches。
+  // 11-01 起每批推荐另存进 recommendation_batches（只追加），11-16 起主表只保留
+  // "当日评分最高的一批"，所以这里除了名单还要标出哪一批进了主表（active）。
   const dayBatches = ref([])
   const batchOpen = ref(false)
   const batchSummary = computed(() => {
     const withStocks = dayBatches.value.filter(g => g.stocks.length)
     if (!withStocks.length) return '今日暂无推荐档批次'
-    return withStocks.map(g => `${g.batch}·${g.stocks.length}只`).join(' / ')
+    return withStocks
+      .map(g => {
+        const scored = g.stocks.filter(s => !s.isCash).map(s => Number(s.score) || 0)
+        const top = scored.length ? Math.max(...scored) : null
+        const head = g.batchTime || g.batch
+        const tag = g.cash ? '·空仓' : top != null ? `·${top}分` : ''
+        return `${head}${tag}${g.active ? '·主表' : ''}`
+      })
+      .join(' / ')
   })
   async function loadBatches() {
     try {
@@ -487,6 +509,7 @@
         todayDate.value = new Date().toLocaleDateString('zh-CN')
         if (result.cycleInfo !== undefined) cycleInfo.value = result.cycleInfo
         showNotification('推荐生成成功')
+        loadBatches()                       // 新批次已留痕，折叠区跟着刷新
       } else {
         showNotification(result.error || '生成失败')
       }
@@ -525,6 +548,7 @@
       if (result.success) {
         showNotification('保存成功！推荐记录已保存到数据库')
         await loadRecommendations()
+        loadBatches()                       // 手工保存也留痕，折叠区同步
       } else {
         showNotification('保存失败：' + (result.error || '未知错误'))
       }
@@ -624,6 +648,38 @@
   }
   .batch-group {
     margin-bottom: 6px;
+  }
+  /* 进了主表的那一批描边高亮：用户最常问"现在看到的到底是哪一批" */
+  .batch-group-active {
+    background: #eff6ff;
+    border-left: 2px solid #3b82f6;
+    border-radius: 4px;
+    padding-left: 6px;
+    margin-left: -8px;
+  }
+  .batch-tag {
+    font-size: 10px;
+    line-height: 1.5;
+    color: #64748b;
+    border: 1px solid #e2e8f0;
+    background: #fff;
+    border-radius: 4px;
+    padding: 0 4px;
+  }
+  .batch-tag-active {
+    color: #1d4ed8;
+    border-color: #bfdbfe;
+    background: #dbeafe;
+    font-weight: 600;
+  }
+  .batch-tag-cash {
+    color: #92400e;
+    border-color: #fde68a;
+    background: #fef3c7;
+  }
+  .batch-cash {
+    font-size: 11px;
+    color: #92400e;
   }
   .batch-g-h {
     display: flex;

@@ -1958,7 +1958,7 @@ async def auto_generate_recommendations_task(source: str = 'manual'):
                 if len(_existing) > QUERY_DAILY_RECOMMENDATIONS_LIMIT:
                     _existing = _existing[:QUERY_DAILY_RECOMMENDATIONS_LIMIT]
                 save_daily_recommendations(_existing, batch_time=now.strftime('%H:%M:%S'),
-                                           source=source or 'manual')
+                                           source=source or 'manual', keep_best=True)
                 print(f'[周期调度] 空仓哨兵已写入：{_reason}')
             else:
                 print(f'[智能推荐] 无评分>={MIN_RECOMMEND_SCORE}的股票，跳过')
@@ -2048,7 +2048,7 @@ async def auto_generate_recommendations_task(source: str = 'manual'):
         if len(existing) > QUERY_DAILY_RECOMMENDATIONS_LIMIT:
             existing = existing[:QUERY_DAILY_RECOMMENDATIONS_LIMIT]
         saved = save_daily_recommendations(existing, batch_time=now.strftime('%H:%M:%S'),
-                                           source=source or 'manual')
+                                           source=source or 'manual', keep_best=True)
 
         # ===== 7.5 影子精选（2026-10-14，只记录不替换）=====
         # 为什么必须影子而不是直接换：15:20 的回测与 15:35 的自动优化都在学现有口径，
