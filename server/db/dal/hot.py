@@ -279,16 +279,33 @@ def load_hot_search_ranking() -> Dict:
                 'hotRank': row['hot_rank'] if 'hot_rank' in row.keys() else 0
             })
 
+        # 2026-11-19：clist 跳过可观测。抓取侧返回体带 clistSkipped/clistCounts，
+        # 但接口是从库里回放，不回填就等于只看得到进程内的那一次。
+        counts = {'change': 0, 'turnover': 0}
+        try:
+            raw_counts = meta.get('clistCounts')
+            if raw_counts:
+                parsed = json.loads(raw_counts)
+                if isinstance(parsed, dict):
+                    counts['change'] = int(parsed.get('change', 0) or 0)
+                    counts['turnover'] = int(parsed.get('turnover', 0) or 0)
+        except Exception:
+            pass
+
         return {
             'updateTime': meta.get('updateTime', ''),
             'total': int(meta.get('total', 0)),
             'filteredCount': int(meta.get('filteredCount', 0)),
             'source': meta.get('source', ''),
+            'clistSkipped': meta.get('clistSkipped', '0') == '1',
+            'clistCounts': counts,
             'stocks': stocks
         }
     except Exception as error:
         print(f'加载hot_search_ranking数据失败: {str(error)}')
-        return {'updateTime': '', 'total': 0, 'filteredCount': 0, 'stocks': []}
+        return {'updateTime': '', 'total': 0, 'filteredCount': 0, 'source': '',
+                'clistSkipped': False, 'clistCounts': {'change': 0, 'turnover': 0},
+                'stocks': []}
 
 
 def save_hot_search_ranking(data: Dict) -> bool:
@@ -310,7 +327,11 @@ def save_hot_search_ranking(data: Dict) -> bool:
         for key, value in [('updateTime', data.get('updateTime', '')),
                            ('total', str(data.get('total', 0))),
                            ('filteredCount', str(data.get('filteredCount', 0))),
-                           ('source', str(data.get('source', '') or ''))]:
+                           ('source', str(data.get('source', '') or '')),
+                           # 2026-11-19：clist 跳过可观测，落 meta 才能在接口回放里看到
+                           ('clistSkipped', '1' if data.get('clistSkipped') else '0'),
+                           ('clistCounts', json.dumps(
+                               data.get('clistCounts') or {'change': 0, 'turnover': 0}))]:
             cursor.execute(
                 'INSERT INTO hot_search_meta (meta_key, meta_value) VALUES (?, ?)',
                 (key, value)

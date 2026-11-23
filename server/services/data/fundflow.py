@@ -351,6 +351,12 @@ _SINA_MONEY_FLOW_URL = ('https://vip.stock.finance.sina.com.cn/quotes_service/ap
 _SINA_RANK_PAGE_SIZE = 100         # 新浪单页上限实测 100
 _SINA_RANK_MAX_PAGES = 80          # 全市场（含基金/债券ETF）约 70 页到底，留余量
 _SINA_RANK_WORKERS = 4             # 并发 4：70 页约 12~18 秒，且不至于像 10 并发那样刺眼
+# 2026-11-21：连接/读取超时分离。旧版统一 timeout=10，新浪连不上时每次请求都跑满
+# 10s；4 并发 × 翻页 × 三个区块叠加，冷穿透实测 8.6s（日志 194 条 ConnectionError
+# Max retries，全是连接阶段失败）。连接 3s 内建不上就快速放弃、交快照兜底；一旦
+# 连上仍给 10s 读数据，不牺牲弱网下的兜底成功率。只影响「连不上」，不改数据口径。
+_SINA_CONNECT_TIMEOUT = 3
+_SINA_READ_TIMEOUT = 10
 _SINA_RANK_TOP_PAGES = 2           # 个股排名每侧取 2 页（200 只，过滤掉基金后够截 top_n）
 _SINA_SNAPSHOT_CACHE: Dict[str, object] = {}   # 全市场快照 {'ts': float, 'rows': List[Dict]}
 _SINA_SNAPSHOT_TTL = 1800                      # 全市场快照 30 分钟（板块聚合用它，30 分钟够新）
@@ -439,7 +445,9 @@ def _sina_rank_page(sort: str, asc: int, page: int) -> List[Dict]:
         r = requests.get(_SINA_RANK_URL,
                          params={'page': page, 'num': _SINA_RANK_PAGE_SIZE,
                                  'sort': sort, 'asc': asc},
-                         headers=_SINA_HEADERS, timeout=10, proxies=_NO_PROXY)
+                         headers=_SINA_HEADERS,
+                         timeout=(_SINA_CONNECT_TIMEOUT, _SINA_READ_TIMEOUT),
+                         proxies=_NO_PROXY)
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, list) else []

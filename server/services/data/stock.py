@@ -495,6 +495,10 @@ async def fetch_eastmoney_hot_list():
     # 人气榜 API 端点（东方财富股吧真实人气榜）
     _POPULARITY_API = 'https://emappdata.eastmoney.com/stockrank/getAllCurrentList'
 
+    # 2026-11-19：clist 被闸门跳过时旧实现静默 return []，接口仍 success，
+    # 榜单从 459 只缩到 50 只却看不出来。这里把"跳过/两榜各取到多少"带进返回体。
+    clist_meta = {'skipped': False, 'changeRaw': 0, 'turnoverRaw': 0}
+
     def _fetch_clist(fid: str, fetch_count: int) -> list:
         """从东方财富 clist 接口拉取全 A 股（按 fid 排序），返回原始 diff 列表。
 
@@ -504,6 +508,9 @@ async def fetch_eastmoney_hot_list():
         try:
             from services.data import eastmoney_guard
             if eastmoney_guard.skip('clist'):
+                clist_meta['skipped'] = True
+                print('[热搜榜] 东财 clist 被闸门跳过：涨幅榜/成交额榜本轮无数据'
+                      '（人气榜/同花顺/腾讯仍可用）')
                 return []
         except Exception:
             pass
@@ -862,6 +869,7 @@ async def fetch_eastmoney_hot_list():
             # 2. 涨幅榜（clist fid=f3）
             change_fetch = int(CHANGE_RANK_TOP_N * 1.6)
             change_raw = _fetch_clist('f3', change_fetch)
+            clist_meta['changeRaw'] = len(change_raw)
             change_list = _filter_mainboard(change_raw, CHANGE_RANK_TOP_N)
             print(f'[热搜榜] 涨幅榜获取 {len(change_list)} 只')
 
@@ -869,6 +877,7 @@ async def fetch_eastmoney_hot_list():
             time.sleep(0.2)
             turnover_fetch = int(TURNOVER_RANK_TOP_N * 1.6)
             turnover_raw = _fetch_clist('f6', turnover_fetch)
+            clist_meta['turnoverRaw'] = len(turnover_raw)
             turnover_list = _filter_mainboard(turnover_raw, TURNOVER_RANK_TOP_N)
             print(f'[热搜榜] 成交额榜获取 {len(turnover_list)} 只')
 
@@ -986,6 +995,10 @@ async def fetch_eastmoney_hot_list():
             'total': len(result),
             'filteredCount': len(result),
             'source': source['popularity'],
+            # 2026-11-19：clist 被闸门跳过时榜单会缩水（实测 459→50），必须能看出来
+            'clistSkipped': clist_meta['skipped'],
+            'clistCounts': {'change': clist_meta['changeRaw'],
+                            'turnover': clist_meta['turnoverRaw']},
             'stocks': result
         }
 

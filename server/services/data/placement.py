@@ -15,6 +15,8 @@ from typing import Dict, List, Optional
 
 import requests
 
+from app.config import PLACEMENT_DB_FALLBACK, PLACEMENT_DB_KEEP_DAYS
+
 # 东财公告接口（与收评/龙虎榜同源）
 _ANNOUNCE_API = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
 
@@ -40,6 +42,87 @@ def _norm_symbol(symbol: str) -> str:
     return symbol[-6:] if symbol else symbol
 
 
+# 2026-11-19：此前东财公告接口停调时 `_fetch_batch_announcements` 直接返回 []，
+# 推荐卡片的"📢 近期增发"标签会静默消失（无表、无缓存、无备源）。落一张公告表，
+# 成功拉取即写，停调/失败按窗口回读（多报一个已发生的公告无害，漏报是风险信息缺失）。
+_PLACEMENT_DDL = '''CREATE TABLE IF NOT EXISTS placement_announcement (
+    stock_code TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    notice_date TEXT NOT NULL,
+    fetched_at TEXT,
+    PRIMARY KEY (stock_code, title, notice_date)
+)'''
+
+
+def _save_announcements(items: List[Dict]) -> None:
+    rows = []
+    stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    for it in items or []:
+        code = str(it.get('stock_code') or '')
+        title = str(it.get('title') or '')
+        date = str(it.get('notice_date') or '')
+        if code and title and date:
+            rows.append((code, title, date, stamp))
+    if not rows:
+        return
+    try:
+        from db.database import get_db_conn
+        conn = get_db_conn()
+        try:
+            conn.execute(_PLACEMENT_DDL)
+            conn.executemany(
+                'INSERT OR REPLACE INTO placement_announcement '
+                '(stock_code, title, notice_date, fetched_at) VALUES (?,?,?,?)', rows)
+            # 顺手清掉表内过老的记录，避免无界增长
+            keep_from = (datetime.now() - timedelta(days=PLACEMENT_DB_KEEP_DAYS)).strftime('%Y-%m-%d')
+            conn.execute('DELETE FROM placement_announcement WHERE notice_date < ?', (keep_from,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f'[增发公告] 落库失败（不影响推荐）: {e}')
+
+
+def _load_recent_announcements(cutoff: datetime, codes: List[str]) -> List[Dict]:
+    """读窗口内、指定代码的公告。失败/无表返回 []，绝不编数。"""
+    if not codes:
+        return []
+    try:
+        from db.database import get_db_conn
+        conn = get_db_conn()
+        try:
+            conn.execute(_PLACEMENT_DDL)
+            marks = ','.join('?' for _ in codes)
+            rows = conn.execute(
+                'SELECT stock_code, title, notice_date FROM placement_announcement '
+                'WHERE notice_date >= ? AND stock_code IN (' + marks + ') '
+                'ORDER BY notice_date DESC',
+                (cutoff.strftime('%Y-%m-%d'), *codes)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f'[增发公告] 回读失败: {e}')
+        return []
+
+
+def _finish_announcements(results: List[Dict], codes: List[str],
+                          cutoff: datetime, failed: bool) -> List[Dict]:
+    """保存东财拿到的 → 停调/失败/为空时补库内窗口记录。"""
+    if results:
+        _save_announcements(results)
+    if (failed or not results) and PLACEMENT_DB_FALLBACK:
+        db_rows = _load_recent_announcements(cutoff, codes)
+        if db_rows:
+            seen = {(x.get('stock_code'), x.get('title'), x.get('notice_date')) for x in results}
+            added = [x for x in db_rows
+                     if (x.get('stock_code'), x.get('title'), x.get('notice_date')) not in seen]
+            if added:
+                print(f'[增发公告] 回读库内记录 {len(added)} 条（东财不可用）')
+                results.extend(added)
+    return results
+
+
 def _in_window(date_str: str, cutoff: datetime) -> bool:
     """判断公告日期是否在窗口内（notice_date 形如 '2026-09-05 00:00:00'）"""
     try:
@@ -60,9 +143,11 @@ def _fetch_batch_announcements(codes: List[str], cutoff: datetime) -> List[Dict]
     """
     stock_list = ','.join(codes)
     results: List[Dict] = []
+    failed = False
     from services.data import eastmoney_guard
     if eastmoney_guard.skip('ann'):
-        return results
+        # 停调/冷却：回读库内窗口记录（2026-11-19 新增，开关关闭时仍为空）
+        return _finish_announcements(results, codes, cutoff, failed=True)
     for page in range(1, _MAX_PAGES + 1):
         if eastmoney_guard.skip('ann'):
             break   # 熔断可能在本批翻页途中跳闸，后面的页别再打
@@ -78,7 +163,8 @@ def _fetch_batch_announcements(codes: List[str], cutoff: datetime) -> List[Dict]
             eastmoney_guard.ok('ann')
         except Exception as e:
             eastmoney_guard.fail('ann', e)
-            # 单页失败即放弃本批（降级为空），不影响推荐主流程
+            # 单页失败即放弃本批（降级），不影响推荐主流程；下面统一回读库内记录
+            failed = True
             break
         if not lst:
             break
@@ -86,7 +172,7 @@ def _fetch_batch_announcements(codes: List[str], cutoff: datetime) -> List[Dict]
             date = (it.get('notice_date') or '')[:10]
             if date and date < cutoff.strftime('%Y-%m-%d'):
                 # 已早于窗口边界，说明本页数据越界；但后续条目只会更早
-                return results
+                return _finish_announcements(results, codes, cutoff, failed)
             codes_meta = it.get('codes') or []
             stock_code = codes_meta[0].get('stock_code', '') if codes_meta else ''
             results.append({
@@ -97,7 +183,7 @@ def _fetch_batch_announcements(codes: List[str], cutoff: datetime) -> List[Dict]
         # 若本页未填满（说明公告已取完），无需继续翻页
         if len(lst) < _PAGE_SIZE:
             break
-    return results
+    return _finish_announcements(results, codes, cutoff, failed)
 
 
 def fetch_recent_placements(symbols: List[str], days: int = 30) -> Dict[str, Dict]:

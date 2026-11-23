@@ -19,6 +19,7 @@ from datetime import datetime
 import requests
 
 from db.database import save_holder_num_batch, load_holder_num_batch
+from app.config import HOLDER_RESPECT_DOMAIN_GUARD
 
 
 HOLDER_NUM_API = 'https://datacenter-web.eastmoney.com/api/data/v1/get'
@@ -47,11 +48,15 @@ def _fetch_page(pn: int) -> Tuple[List[Dict], int]:
     用 requests + asyncio.to_thread 包装(project_memory 硬约束:禁用 httpx 直连东方财富)。
     失败抛异常，由上层计入失败页数。
 
-    熔断只用**自己的 scope**（ignore_domain=True / clear_domain=False）：
-    datacenter-web 与 push2/push2delay(clist) 不是同一条边缘，2026-10-31 实测
-    clist 全域闸门还在冷却时 datacenter-web 仍 200 返回 5577 行 —— 跟着 clist 一起停
-    等于把能用的数据源也停了，而不加隔离又会用它的成败去误开/误关全域闸门
+    熔断只用**自己的 scope**（clear_domain=False），不拿它的成败去误开/误关全域闸门
     （同 appdata 人气榜 2026-10-23 的处理）。
+
+    **是否穿透全域闸门由 HOLDER_RESPECT_DOMAIN_GUARD 决定（2026-11-19 新增，默认 True＝遵守）**：
+    datacenter-web 与 push2/push2delay(clist) 不是同一条边缘，2026-10-31 实测
+    clist 全域闸门还在冷却时 datacenter-web 仍 200 返回 5577 行 —— 所以历史上用
+    ignore_domain=True 穿过全域闸门。代价是 IP 级封禁时仍会去打东财，属于"明知停调还发请求"。
+    现改为默认 ignore_domain=False（全域闸门开就跳过、库里旧值保留），
+    要回到改造前行为把 HOLDER_RESPECT_DOMAIN_GUARD 置 False 即可（等于 ignore_domain=True）。
     """
     from services.data import eastmoney_guard
     params = {
@@ -109,7 +114,7 @@ async def fetch_all_latest_holder_num() -> Dict[str, Dict]:
                         total_num_ratio, avg_free_shares, avg_hold_amt, notice_date}}
     """
     from services.data import eastmoney_guard
-    if eastmoney_guard.skip(_GUARD_SCOPE, ignore_domain=True):
+    if eastmoney_guard.skip(_GUARD_SCOPE, ignore_domain=not HOLDER_RESPECT_DOMAIN_GUARD):
         print('[股东人数] 东财 datacenter 冷却中，本轮跳过（库里旧数据保留）')
         return {}
     result: Dict[str, Dict] = {}

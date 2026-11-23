@@ -340,6 +340,17 @@ ck(d6['stale'] is False,
 ck('hidden' in (d6.get('staleBlocks') or []),
    f'但旧的那一块必须被点名（实得 {d6.get("staleBlocks")} / 各块龄期 {d6.get("blockAges")}）')
 
+print('\n[7e] 新浪排行连接/读取超时分离（2026-11-21，冷穿透 8.6s 的根因之一）')
+import inspect as _inspect
+_src = _inspect.getsource(F._sina_rank_page)
+ck(F._SINA_CONNECT_TIMEOUT == 3,
+   '连接超时 3s（连不上快速放弃，交快照兜底）')
+ck(F._SINA_READ_TIMEOUT == 10,
+   '读取超时保持 10s（不牺牲弱网兜底成功率）')
+ck('(_SINA_CONNECT_TIMEOUT, _SINA_READ_TIMEOUT)' in _src,
+   '真实实现用的是 (连接, 读取) 元组而非单一 timeout')
+
+
 for _suf in ('', '-wal', '-shm'):
     try:
         os.remove(_TMP + _suf)

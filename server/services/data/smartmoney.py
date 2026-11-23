@@ -43,6 +43,96 @@ _nb_cache: Dict = {'ts': 0, 'data': None}
 
 # 北向 kamt 配置
 _NB_API = 'https://push2.eastmoney.com/api/qt/kamt/get'
+
+# 2026-11-19：北向此前只有 600 秒内存缓存，进程一重启 + 东财停调就只能给全 0 + error，
+# 页面会把 0 当真实净买额。落一张按日表，停调/失败时回读最近一条并显式标 source='db'。
+_NB_DDL = '''CREATE TABLE IF NOT EXISTS northbound_daily (
+    trade_date TEXT PRIMARY KEY,
+    sh_net REAL, sz_net REAL, total REAL,
+    month_sh REAL, month_sz REAL,
+    sentiment TEXT, updated_at TEXT
+)'''
+
+
+def _nb_norm_day(raw: str) -> str:
+    s = str(raw or '').strip()
+    if len(s) >= 10 and s[4] == '-':
+        return s[:10]
+    if len(s) >= 5 and s[2] == '-':
+        return f'{datetime.now().year}-{s[:5]}'
+    return ''
+
+
+def _nb_is_placeholder(sh: Dict, sz: Dict) -> bool:
+    """东财是否已停止披露北向净买入（只给占位值）。
+
+    2026-11-19 实测上游返回：dayNetAmtIn=0、dayAmtRemain=0，
+    且 monthNetAmtIn 恰等于 dayAmtThreshold（额度上限，不是真实月净买额）。
+    三个特征同时成立才判占位，避免把真实的"当日 0 净买"误标成不可用。
+    """
+    def _f(d: Dict, k: str) -> float:
+        try:
+            return float(d.get(k) or 0)
+        except Exception:
+            return 0.0
+    thr = _f(sh, 'dayAmtThreshold')
+    return (abs(_f(sh, 'dayNetAmtIn')) < 1e-6
+            and abs(_f(sh, 'dayAmtRemain')) < 1e-6
+            and thr > 0
+            and abs(_f(sh, 'monthNetAmtIn') - thr) < 1e-6)
+
+
+def _save_northbound(result: Dict) -> None:
+    """成功取数后按日落库；失败只打印，不影响返回。"""
+    day = _nb_norm_day(result.get('date'))
+    if not day:
+        return
+    try:
+        from db.database import get_db_conn
+        conn = get_db_conn()
+        try:
+            conn.execute(_NB_DDL)
+            conn.execute(
+                'INSERT OR REPLACE INTO northbound_daily '
+                '(trade_date,sh_net,sz_net,total,month_sh,month_sz,sentiment,updated_at) '
+                'VALUES (?,?,?,?,?,?,?,?)',
+                (day, result.get('sh_net'), result.get('sz_net'), result.get('total'),
+                 result.get('month_sh'), result.get('month_sz'), result.get('sentiment'),
+                 datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f'[聪明钱] 北向落库失败（不影响返回）: {e}')
+
+
+def _load_northbound_latest(reason: str = '') -> Optional[Dict]:
+    """停调/失败时的回读。返回体带 source='db' / stale=True，前端能看出不是实时。"""
+    try:
+        from db.database import get_db_conn
+        conn = get_db_conn()
+        try:
+            conn.execute(_NB_DDL)
+            row = conn.execute(
+                'SELECT trade_date,sh_net,sz_net,total,month_sh,month_sz,sentiment,updated_at '
+                'FROM northbound_daily ORDER BY trade_date DESC LIMIT 1').fetchone()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f'[聪明钱] 北向回读失败: {e}')
+        return None
+    if not row:
+        return None
+    return {
+        'date': row['trade_date'],
+        'sh_net': row['sh_net'] or 0, 'sz_net': row['sz_net'] or 0,
+        'total': row['total'] or 0,
+        'month_sh': row['month_sh'] or 0, 'month_sz': row['month_sz'] or 0,
+        'sentiment': row['sentiment'] or 'neutral',
+        'updated': row['updated_at'] or '',
+        'source': 'db', 'stale': True,
+        'error': reason or '东财停调中，展示最近一次落库值',
+    }
 _NB_HEADERS = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://data.eastmoney.com/'}
 
 
@@ -304,9 +394,12 @@ def get_northbound_market(force: bool = False) -> Dict:
         return _nb_cache['data']
     from services.data import eastmoney_guard
     if eastmoney_guard.skip('push2'):
-        # 停调中：有旧值就沿用旧值（宁旧不假），没有才给全 0 + error，口径由前端显示
+        # 停调中：内存旧值 → 按日表最近一条（标 source=db）→ 最后才全 0 + error
         if _nb_cache['data']:
             return _nb_cache['data']
+        db = _load_northbound_latest('东财 push2 冷却/当日停调中')
+        if db:
+            return db
         return {'date': '', 'sh_net': 0, 'sz_net': 0, 'total': 0,
                 'month_sh': 0, 'month_sz': 0, 'sentiment': 'neutral',
                 'updated': datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -343,14 +436,25 @@ def get_northbound_market(force: bool = False) -> Dict:
             'sentiment': sentiment,
             'updated': datetime.now().strftime('%Y-%m-%d %H:%M'),
         }
+        # 2026-11-19：停披露后上游仍返回 200 + 全 0/占位额度，不识别就会把 0 当真实净买额。
+        if _nb_is_placeholder(sh, sz):
+            result['dataAvailable'] = False
+            result['note'] = '东财自 2024-08-16 起停止披露北向实时净买入，净额字段为占位值'
+            print('[聪明钱] 北向返回占位值（东财已停披露），不落按日表')
+        else:
+            result['dataAvailable'] = True
+            _save_northbound(result)
         _nb_cache.update({'ts': now, 'data': result})
         return result
     except Exception as e:
         eastmoney_guard.fail('push2', e)
         print(f'[聪明钱] 北向资金获取失败: {e}')
-        # 失败也别把旧值丢掉：有旧缓存就继续给旧缓存（下面这行在 11-06 之前是直接给全 0）
+        # 失败也别把旧值丢掉：内存旧值 → 按日表最近一条 → 最后才全 0
         if _nb_cache['data']:
             return _nb_cache['data']
+        db = _load_northbound_latest(f'北向获取失败: {e}')
+        if db:
+            return db
         return {'date': '', 'sh_net': 0, 'sz_net': 0, 'total': 0,
                 'month_sh': 0, 'month_sz': 0, 'sentiment': 'neutral',
                 'updated': datetime.now().strftime('%Y-%m-%d %H:%M'), 'error': str(e)}

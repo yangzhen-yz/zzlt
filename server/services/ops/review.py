@@ -2,7 +2,7 @@
 import asyncio, time, requests as _requests
 from typing import List, Dict, Optional
 from datetime import datetime
-from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, REVIEW_TOMORROW_FOCUS_MIN_WIN_RATE, REVIEW_TOMORROW_FOCUS_MIN_KEEP, EASTMONEY_HEADERS)
+from app.config import (STRATEGY_PREDICT_BULL_MIN_SCORE, REVIEW_TOP_GAINERS_COUNT, REVIEW_TOP_LOSERS_COUNT, REVIEW_TOMORROW_FOCUS_COUNT, REVIEW_TOMORROW_FOCUS_MIN_WIN_RATE, REVIEW_TOMORROW_FOCUS_MIN_KEEP, REVIEW_POOL_DB_FALLBACK, REVIEW_PREMIUM_TENCENT_FALLBACK, EASTMONEY_HEADERS)
 # 2026-07-02 : _EM_HEADERS 已合并到 config.EASTMONEY_HEADERS
 from db.database import (get_db_conn, load_daily_recommendations, load_trend_scan_results)
 from services.data.stock import fetch_stock_data
@@ -736,6 +736,124 @@ def _fetch_market_breadth() -> Dict:
     return breadth
 
 
+def _pool_item_to_review(item: Dict) -> Dict:
+    """东财池/备源统一键名（c/n/p）→ 收评返回体的个股字段（`p` 是毫元）。
+
+    涨跌幅键名两套都要认：东财池是 `zdp`，`sentiment_alt._classify` 给的是 `zdf`
+    （自测 `review_limit_fallback_selftest.py` 的 B 组就是钉这条，漏认会静默变 0）。
+    """
+    return {
+        'name': item.get('n', ''), 'code': item.get('c', ''),
+        'changePercent': item.get('zdp', item.get('zdf', 0)),
+        'price': round((item.get('p') or 0) / 1000, 2),
+        'mainNetInflow': item.get('fund'),
+        'turnoverRate': item.get('hs'),
+    }
+
+
+def _load_day_pools(day_iso: str) -> Dict[str, List[Dict]]:
+    """从 limit_pool_daily 读当天三池，统一转成东财池键名（c/n/p/zdp/lbc/zbc）。
+
+    为什么需要（2026-11-19）：东财 IP 级封禁时涨停池/炸板池被 `skip('pools')` 拦下，
+    收评的连板梯队/炸板率/昨日涨停名单全空；而当天盘中每 5 分钟落库的这份快照
+    就在库里，只是没有读取方。价格按东财口径转毫元（库内是元）。
+
+    返回 {'zt': [...], 'zb': [...], 'dt': [...]}；没表/没数据/异常都是全空列表，
+    调用方据此保持"拿不到就是 None"，绝不编数。
+    """
+    out: Dict[str, List[Dict]] = {'zt': [], 'zb': [], 'dt': []}
+    try:
+        from services.data.limit_pool import load_day
+        rows = load_day(day_iso) or []
+    except Exception as e:
+        print(f'[收评] limit_pool_daily 回读失败 {day_iso}: {e}')
+        return out
+    for row in rows:
+        pool = row.get('pool')
+        if pool not in out:
+            continue
+        price = row.get('price')
+        out[pool].append({
+            'c': row.get('symbol'), 'n': row.get('name'),
+            'p': (price * 1000) if price is not None else None,
+            'zdp': row.get('change_pct'), 'lbc': row.get('lianban'),
+            'zbc': row.get('zhaban'), 'fund': row.get('seal_fund'),
+            'hs': row.get('turnover'),
+        })
+    return out
+
+
+def _tencent_batch_change_percent(codes: List[str], batch_size: int = 60) -> Dict[str, float]:
+    """腾讯批量涨跌幅备源（东财 ulist 被闸门跳过时用）。返回 {6位代码: 涨跌幅}。
+
+    只在昨日涨停溢价这一处使用：名单来自库/池子，今天的涨跌幅必须另找一个源；
+    腾讯行情不受东财封禁影响，一次可查几十只。失败返回 {}，调用方照旧判 None。
+    """
+    out: Dict[str, float] = {}
+    clean = []
+    for c in (codes or []):
+        c = str(c or '').strip()[-6:]
+        if len(c) == 6 and c.isdigit():
+            clean.append(c)
+    if not clean:
+        return out
+    try:
+        from app.config import TENCENT_QUOTE_API
+        from services.data.stock import parse_tencent_batch_data
+    except Exception as e:
+        print(f'[收评] 腾讯行情备源不可用: {e}')
+        return out
+    for i in range(0, len(clean), batch_size):
+        chunk = clean[i:i + batch_size]
+        syms = ','.join(('sh' if c.startswith('6') else 'sz') + c for c in chunk)
+        try:
+            r = _requests.get(TENCENT_QUOTE_API + syms, timeout=6,
+                              headers={'User-Agent': _EM_POOL_HEADERS['User-Agent'],
+                                       'Referer': 'https://gu.qq.com/'})
+            r.raise_for_status()
+            r.encoding = 'gbk'
+            for it in parse_tencent_batch_data(r.text):
+                code = str(it.get('code') or '')[-6:]
+                pct = it.get('changePercent')
+                if code and pct is not None:
+                    out[code] = pct
+        except Exception as e:
+            print(f'[收评] 腾讯行情备源批量失败: {e}')
+    return out
+
+
+def _fallback_limit_lists(day_iso: str) -> Optional[Dict]:
+    """东财涨停/跌停池取不到时的两级备源（2026-11-19）。
+
+    为什么要有：11-19 东财全域闸门（IP 级封禁）在 15:12 收评跑的时候还开着，
+    `ztpool/dtpoll` 直接跳过、`clist` 阈值降级也过不了闸门 → 收评落库 涨停0/跌停0、
+    页面上涨跌停比显示 "--"。而当天真实的池子其实有两处可得，只是没人接。
+
+    顺序（每级都标 `source`，收评文案/落库不混算）：
+      ① `sentiment_alt.limit_counts()`：新浪排行 + 腾讯昨收精确判封，**剔 ST**，
+         收盘后现算即当日最终值（11-19 实测 涨停24/跌停78，含 ST 28/83）。
+      ② `limit_pool.load_day()`：当天已落库的东财池（盘中每 5 分钟快照，至少不是 0，
+         但可能不是收盘最终值）。
+
+    列表项统一成东财池的键名（`c/n/p/zdp`，`p` 为毫元），调用方走同一套映射。
+    失败/开关关闭返回 None，调用方保持原来的空列表行为（如实显示 0，不编数）。
+    """
+    try:
+        from app.config import SENTIMENT_ALT_FALLBACK
+        if SENTIMENT_ALT_FALLBACK:
+            from services.data import sentiment_alt
+            r = sentiment_alt.limit_counts()
+            if r and 'ztList' in r:
+                return {'zt': r.get('ztList') or [], 'dt': r.get('dtList') or [],
+                        'source': f"{r.get('source') or 'sina_rank'}_alt"}
+    except Exception as e:
+        print(f'[收评] 涨跌停新浪备源失败: {e}')
+    dbp = _load_day_pools(day_iso)
+    if dbp['zt'] or dbp['dt']:
+        return {'zt': dbp['zt'], 'dt': dbp['dt'], 'source': 'limit_pool_daily'}
+    return None
+
+
 def _calc_lianban_ladder(zt_pool_raw: List[Dict]) -> Dict:
     """连板梯队：从涨停池 lbc（连板数）统计高度分布"""
     ladder = {'maxLianban': None, 'lianbanGe3': None, 'lianbanEq2': None, 'firstBoard': None}
@@ -749,33 +867,48 @@ def _calc_lianban_ladder(zt_pool_raw: List[Dict]) -> Dict:
     return ladder
 
 
-def _calc_yesterday_limitup_premium(zt_limit: int = 200) -> Optional[float]:
+def _calc_yesterday_limitup_premium(zt_limit: int = 200, with_source: bool = False):
     """昨日涨停股今日平均表现（打板资金赚钱效应，短线情绪最直接指标）
 
     实现回溯最近4个自然日找到有涨停池数据的交易日，拉其涨停池，
     再批量查这些股票今日涨跌幅取均值。
+
+    2026-11-19 备源：东财 pools 被闸门跳过时名单退 limit_pool_daily（盘中快照）；
+    东财 ulist 被跳过时今日涨跌幅退腾讯批量。`with_source=True` 返回 (值, 来源)。
     """
     from datetime import timedelta
     today = datetime.now().date()
+    value = None
+    src = 'none'
     for back in range(1, 5):
         d = (today - timedelta(days=back)).strftime('%Y%m%d')
         try:
             pool = _em_zt_pool_get(d, pagesize=zt_limit, retries=1)
         except Exception:
             pool = []
-        if not pool:
-            continue
         codes = [str(item.get('c', '')) for item in pool if item.get('c')]
+        list_src = 'eastmoney' if codes else None
+        if not codes and REVIEW_POOL_DB_FALLBACK:
+            _dbp = _load_day_pools(f'{d[:4]}-{d[4:6]}-{d[6:8]}')
+            codes = [str(x.get('c')) for x in _dbp['zt'] if x.get('c')]
+            list_src = 'limit_pool_daily' if codes else None
         if not codes:
-            return None
+            continue
         quotes = _em_batch_change_percent(codes)
+        quote_src = 'eastmoney' if quotes else None
+        if not quotes and REVIEW_PREMIUM_TENCENT_FALLBACK:
+            quotes = _tencent_batch_change_percent(codes)
+            quote_src = 'tencent' if quotes else None
         if not quotes:
-            return None
+            return (None, 'none') if with_source else None
         pcts = [quotes[c] for c in codes if c in quotes]
         if not pcts:
-            return None
-        return round(sum(pcts) / len(pcts), 2)
-    return None
+            return (None, 'none') if with_source else None
+        value = round(sum(pcts) / len(pcts), 2)
+        src = f'{list_src}+{quote_src}'
+        print(f'[收评] 昨日涨停溢价 {value}%（名单 {list_src} / 行情 {quote_src}，n={len(pcts)}）')
+        break
+    return (value, src) if with_source else value
 
 
 def _calc_sentiment_cycle(limit_up_count: int, limit_down_count: int,
@@ -1012,20 +1145,41 @@ async def generate_daily_review() -> Dict:
         # 3. 获取涨跌停个股 — 优先使用东方财富涨停池/跌停池专用API（准确），降级用clist+分板阈值
         limit_up_stocks = []
         limit_down_stocks = []
+        limit_source = 'eastmoney'
         top_gainers = []
         top_losers = []
         top_funds = []  # 全市场主力净流入前20
         def _sync_fetch_stocks():
             result = {'limit_up': [], 'limit_down': [], 'gainers': [], 'losers': [], 'top_funds': [],
-                      'zt_pool_raw': [], 'zhaban_count': None}
+                      'zt_pool_raw': [], 'zhaban_count': None, 'limit_source': 'eastmoney'}
             _fs_all_a = 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048'
             _today_yyyymmdd = datetime.now().strftime('%Y%m%d')
             _zb_pool: List[Dict] = []          # 涨停池为空时不查炸板池，落库要能拿到空列表
 
             # ---- 涨停股：优先用涨停池专用API ----
             _zt_pool = _em_zt_pool_get(_today_yyyymmdd, pool_type='zt')
+            _zt_raw = _zt_pool
+            _struct_from_db = False
+            _dbp: Optional[Dict[str, List[Dict]]] = None
+
+            def _db_pools() -> Dict[str, List[Dict]]:
+                nonlocal _dbp
+                if _dbp is None:
+                    _dbp = _load_day_pools(datetime.now().strftime('%Y-%m-%d'))
+                return _dbp
+
+            # 2026-11-19：东财池被闸门跳过时，结构维度（连板梯队/炸板数）退库里的当天
+            # 盘中快照；家数口径不在这里决定（仍走 clist → 新浪 → 库的两级备源）。
+            if not _zt_pool and REVIEW_POOL_DB_FALLBACK:
+                _p = _db_pools()
+                if _p['zt']:
+                    _zt_raw = _p['zt']
+                    _struct_from_db = True
+                    print(f"[收评] 涨停池改用 limit_pool_daily 盘中快照: {len(_zt_raw)} 只"
+                          f"（含连板数，供梯队计算）")
             # 保留原始池数据（含 lbc 连板数）供情绪周期梯队计算
-            result['zt_pool_raw'] = _zt_pool
+            result['zt_pool_raw'] = _zt_raw
+            result['pool_source'] = 'limit_pool_daily' if _struct_from_db else 'eastmoney'
             # 炸板数：仅当涨停池API正常返回时才查询；空结果视为未知（None），避免误判为0炸板
             if _zt_pool:
                 _zb_pool = _em_zb_pool_get(_today_yyyymmdd)
@@ -1085,6 +1239,33 @@ async def generate_daily_review() -> Dict:
                             })
                 except Exception as e:
                     print(f'[收评] 跌停股降级请求失败: {e}')
+
+            # 3b. 东财池 + clist 阈值都空：走备源（新浪+腾讯 判封 / 当天已落库的池子）
+            # 11-19 实测：全域闸门开着时上面三段全返回 []，收评就落成 涨停0/跌停0。
+            if not result['limit_up'] or not result['limit_down']:
+                _fb = _fallback_limit_lists(datetime.now().strftime('%Y-%m-%d'))
+                if _fb:
+                    _filled = False
+                    if not result['limit_up'] and _fb.get('zt'):
+                        result['limit_up'] = [_pool_item_to_review(x) for x in _fb['zt']]
+                        _filled = True
+                    if not result['limit_down'] and _fb.get('dt'):
+                        result['limit_down'] = [_pool_item_to_review(x) for x in _fb['dt']]
+                        _filled = True
+                    if _filled:
+                        result['limit_source'] = _fb['source']
+                        print(f"[收评] 涨跌停改用备源 {_fb['source']}: "
+                              f"涨停{len(result['limit_up'])}/跌停{len(result['limit_down'])}")
+
+            # 炸板数只在与家数同源时补：家数来自新浪（剔 ST、口径不同）时，
+            # 拿库里的炸板数除以新浪涨停家数属于混算，宁可留 None。
+            if (not _zt_pool and _struct_from_db
+                    and result.get('limit_source') == 'limit_pool_daily'
+                    and result.get('zhaban_count') is None):
+                _zb_db = _db_pools()['zb']
+                if _zb_db:
+                    result['zhaban_count'] = len(_zb_db)
+                    print(f'[收评] 炸板数改用 limit_pool_daily: {len(_zb_db)} 只（与家数同源）')
 
             # 涨幅前20（东财 clist → 新浪排行兜底）
             _g = []
@@ -1151,6 +1332,7 @@ async def generate_daily_review() -> Dict:
             _stock_data = await asyncio.to_thread(_sync_fetch_stocks)
             limit_up_stocks = _stock_data['limit_up']
             limit_down_stocks = _stock_data['limit_down']
+            limit_source = _stock_data.get('limit_source', 'eastmoney')
             top_gainers = _stock_data['gainers']
             top_losers = _stock_data['losers']
             top_funds = _stock_data['top_funds']
@@ -1165,13 +1347,19 @@ async def generate_daily_review() -> Dict:
             def _sync_fetch_sentiment():
                 breadth = _fetch_market_breadth()
                 ladder = _calc_lianban_ladder(_stock_data.get('zt_pool_raw') or [])
-                yesterday_premium = _calc_yesterday_limitup_premium()
-                return _calc_sentiment_cycle(
+                yesterday_premium, premium_src = _calc_yesterday_limitup_premium(with_source=True)
+                cycle = _calc_sentiment_cycle(
                     limit_up_count=len(limit_up_stocks),
                     limit_down_count=len(limit_down_stocks),
                     breadth=breadth, ladder=ladder,
                     zhaban_count=_stock_data.get('zhaban_count'),
                     yesterday_premium=yesterday_premium)
+                if isinstance(cycle, dict):
+                    # 结构维度来源要能看出来：家数走新浪、梯队走库里快照时不能假装同源
+                    cycle.setdefault('indicators', {})
+                    cycle['indicators']['structSource'] = _stock_data.get('pool_source') or 'eastmoney'
+                    cycle['indicators']['premiumSource'] = premium_src
+                return cycle
             sentiment_cycle = await asyncio.to_thread(_sync_fetch_sentiment)
             if sentiment_cycle:
                 print(f'[收评] 情绪周期: {sentiment_cycle["cycle"]}({sentiment_cycle["cycleScore"]}分) {sentiment_cycle["detail"]}')
@@ -1405,6 +1593,10 @@ async def generate_daily_review() -> Dict:
             # 真实总数：涨停/跌停家数（前端 KPI 卡直接展示，不再依赖截取后的数组长度
             'limitUpCount': len(limit_up_stocks),
             'limitDownCount': len(limit_down_stocks),
+            # 家数来源：eastmoney（池子API 或 clist 阈值，都是东财口径）
+            # / sina_rank_alt（新浪+腾讯判封，剔 ST） / limit_pool_daily（当天落库快照）。
+            # 页面与复盘必须能分清口径，别把备源数写成东财数。
+            'limitCountSource': limit_source,
             # 数组只截前 20 只用于前端详情列表（避免 DB 存太多）
             'limitUpStocks': limit_up_stocks[:20],
             'limitDownStocks': limit_down_stocks[:20],
@@ -1446,6 +1638,11 @@ async def generate_daily_review() -> Dict:
             summary_lines.append(f'概念板块中，{top_con["name"]}表现最强（+{top_con["changePercent"]}%）。')
         
         summary_lines.append(f'涨停{len(limit_up_stocks)}只，跌停{len(limit_down_stocks)}只。')
+        if limit_source != 'eastmoney':
+            _src_note = {'sina_rank_alt': '新浪+腾讯备源，已剔 ST',
+                         'limit_pool_daily': '当天东财池盘中快照，非收盘最终值'}.get(
+                             limit_source, limit_source)
+            summary_lines.append(f'（家数来源：{_src_note}）')
 
         if sentiment_cycle:
             summary_lines.append(f'短线情绪：{sentiment_cycle["cycle"]}期（{sentiment_cycle["cycleScore"]}分）。{sentiment_cycle["advice"]}')
