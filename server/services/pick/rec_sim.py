@@ -10,22 +10,20 @@
 最后一次快照），所以它回答的是"系统真的推了谁"；当天没被推的票依然看不见，
 这是它和 pool_backtest.py（拿 r20 代理海选）最大的区别。
 
-三条最容易骗人的口径，这里都按"现实里做不到就不算"处理
+成交口径只有一种：现实里买不到就不算（2026-11-24 起）
 ------------------------------------------------------
-  1. **封死涨停 = 买不到**：默认直接剔除并计数（`entry='tailclose'`）。
-     系统偏爱强势票，126 条里有 64 条当天封死——把这些当成"我买到了"，
-     三个月能从 -25% 变成 +25%，这种"改进"是假的。
-     但完全不处理也不对：卡片对这些票的本意是**次日竞价买**，所以另有
-     `entry='auction'` 按推荐顺延一根（并执行卡片写的"高开 5% 以上不追"纪律）。
-     `entry='filled'` 是排板 100% 成交的上界，只在比较"错过多少"时用。
-     2026-10-20 把"封死"的判据换成**价位**：只要当日最低价低于涨停价，就说明存在过
-     可成交的价格（炸过板），不再一律剔除；一字/T 字全天没低下去过才算买不到。
+  1. **封死涨停 = 买不到**：一字/T 字（全天最低价都没低于涨停价）直接剔除并计数。
+     2026-10-20 起判据用**价位**：只要当日最低价低于涨停价，就说明真实出现过可买价
+     （炸过板也算），不再一律剔除；但买入价仍取当日真实存在过的推荐记录价或复权收盘价。
   2. **卖不掉就顺延**：跌停那天如果全天最高价都没高过跌停价（真一字跌停），挂着也出不去，
-     顺延到下一根K线。2026-10-20 之前这条**只对开盘卖生效**，尾盘卖（`mode='close'`）连检查都没有,
-     等于假设一字跌停也能按收盘价卖掉——回撤因此被系统性低估。现在两种卖法都判。
+     顺延到下一根K线；尾盘卖同样判。绝不假设一字跌停也能按收盘价卖掉。
   3. **前复权 vs 当时实盘价不是一个尺度**：记录价落在当日 [最低, 最高] 之外
-     说明期间除过权，这时买入价退回当日复权收盘并计数（比"与收盘差多少"可靠，
-     差 1% 以内也可能已经越界）。
+     说明期间除过权，这时买入价退回当日复权收盘并计数。
+
+  2026-11-24 按用户"去掉所有假设、只留确实能买进卖出"的要求，删除了两条反事实口径：
+  `auction`（假设封板票次日竞价也买到了）与 `filled`（假设排板 100% 成交）。
+  它们曾经被用来框"上下界"，但既不真实也无决策价值，生产回测、页面与每日监控都不再计算。
+  `paiban`（开板即成交在涨停价）仍只由离线脚本调用，不进页面、不进 simulate()。
 
 分仓与资金：当日有几只推荐就均分**当时可用**现金，100 股一手（高价票因此会自动少买，
 这是真实约束不是 bug）；卖出资金当日可用，所以下午能接早盘的回款。
@@ -45,15 +43,13 @@ STAMP = 0.0005          # 证券交易印花税（卖出，2023-08-28 起减半�
 TRANSFER = 0.00001      # 过户费（双边）
 
 ENTRIES = {
-    'tailclose': '尾盘买入（封板买不到就剔除）',
-    'auction': '按推荐执行（封板票次日竞价买·高开>5%不追）',
-    'filled': '排板全成交（上界，现实做不到）',
-    # 2026-11-02 加：只由离线对照脚本调用，不进 simulate() 的六口径、页面不下发——
-    # 排板挂涨停价，开板那一刻就成交，收盘没封回去的当天就浮亏（旧三条都没算这笔）
+    'tailclose': '尾盘买入（一字封死买不到就剔除）',
+    # 只由离线对照脚本调用，不进 simulate()、页面不下发——
+    # 排板挂涨停价，开板那一刻就成交，收盘没封回去的当天就浮亏。
     'paiban': '排板真实成交（开板即成交在涨停价·一字排不进）',
 }
 MODES = {'open': '次日开盘卖', 'close': '次日尾盘卖'}
-DEFAULT_CURVES = ('auction_open', 'auction_close')
+DEFAULT_CURVES = ('tailclose_open',)
 
 
 def _fee_buy(amount: float) -> float:
@@ -129,7 +125,8 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
     """把每条推荐翻译成"哪天买、哪天卖、什么价"，先不谈钱 —— 资金循环交给 run()。
 
     mode: 'open' 次日开盘卖 / 'close' 次日尾盘（收盘）卖
-    entry: 见 ENTRIES；auction_max_gap 是"高开多少就不追"的纪律阈值（999=不限制）
+    entry: 见 ENTRIES（生产只用 'tailclose'）；auction_max_gap 为旧参数，
+           竞价口径删除后对 tailclose 没有任何影响，保留只是不破坏旧调用方。
 
     封板判定（2026-10-20 改，两个独立开关、都关掉即回到旧行为）：
       · `rec_sim_board_price_v2` 开：封不封死看**当日是否存在突破价成交**——
@@ -166,11 +163,8 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
                 entry_note = ('记录价越出当日高低区间(期间除权)→买入价改用当日复权收盘'
                               if rp else '记录价缺失→买入价用复权收盘')
             # 两档判据不能合成一个：
-            #   sealed_at_close＝收盘仍钉在涨停价（卡片的本意是"次日竞价关注"，auction 入口该走那条）；
-            #   sealed_hard＝全天一分都没低于涨停价（真一字/T字，谁都买不到，只有它才该被剔除）。
-            # 旧实现用同一个 sealed 表达这两件事；v2 只放宽"能不能买"，如果继续共用一个变量，
-            # 就会把 auction 的分支一起带偏（实测：剔除从 23 掉到 6，那不是更真实，
-            # 而是涨停票不再走次日竞价、改成按当天涨停价买——反而更乐观）。
+            #   sealed_at_close＝收盘仍钉在涨停价（只用于 note：盘中炸过板、收盘回封）；
+            #   sealed_hard＝全天没有低于涨停价的成交（真一字/T字，谁都买不到 → 剔除）。
             lu_buy, ld_buy = _limit_prices(prev_c or 0, lim)
             if lu_buy > 0:
                 sealed_at_close = (abs(h - c) < 1e-6 and c >= lu_buy - REC_SIM_BOARD_EPS)
@@ -186,8 +180,8 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
                 # 排板挂的是**涨停价**，不是收盘价：只有当天真的开过板（价格跌破涨停）才轮得到
                 # 你成交，成交那一刻就是涨停价。收盘还封着的票两者数值相同（收盘=涨停价），
                 # 但**盘中触板、收盘没封回去**的那部分，你是买在涨停价、当天就浮亏——
-                # 现有三条口径都没算这笔：tailclose 按收盘价买，等于假设你能在炸板后的低价买到，
-                # 是偏乐观的；filled 干脆假设一字也排得到，是上界。这条是"排队排到"的真实版。
+                # tailclose 按收盘价买，等于假设你能在炸板后的低价买到，是偏乐观的；
+                # 这条是"排队排到"的真实版，仍只供离线对照，不进页面。
                 if lu_buy <= 0:
                     skipped.append((r, '缺前收→算不出涨停价，排板无法判定'))
                     continue
@@ -203,31 +197,9 @@ def plan(recs: List[Dict], bars: Dict[str, List[tuple]], mode: str, entry: str =
                               if c < lu_buy - REC_SIM_BOARD_EPS else '排板成交在涨停价（收盘回封）')
                 sealed = False
                 sealed_hard = False
-            if sealed and entry == 'auction':
-                if idx + 2 >= len(series):
-                    skipped.append((r, '次日竞价买入但次次日无K线'))
-                    continue
-                o1, h1, l1, c1 = series[idx + 1][1], series[idx + 1][2], series[idx + 1][3], series[idx + 1][4]
-                if abs(o1 - h1) < 1e-6 and abs(o1 - l1) < 1e-6 and (c1 / c - 1) * 100 >= lim * 0.97:
-                    skipped.append((r, '次日一字开，竞价也买不到'))
-                    continue
-                gap = (o1 / c - 1) * 100
-                if gap > auction_max_gap:
-                    # 卡片原文就写着"高开 5% 以上不追"。这条纪律很值钱：共进股份 07-20
-                    # 竞价 +10.0% 开盘、当天崩到 -10.3%，按纪律不追就不会有那笔 -20%。
-                    skipped.append((r, f'次日竞价高开 {gap:.1f}%＞{auction_max_gap:g}%，按纪律不追'))
-                    continue
-                price, entry_note = o1, '封板票按推荐次日竞价买入'
-                buy_date = series[idx + 1][0]
-                idx += 1                      # 买卖基准整体后移一根
-                # 已经按次日竞价买入了，两档"封死"判定都要清空——
-                # 只清 sealed 不清 sealed_hard 的话，下面那道剔除会把这条分支买进来的票再剔一遍
-                # （自测就是这么抓出来的：auction 的笔数从 101 掉到 60，跟 tailclose 一模一样）。
-                sealed = False
-                sealed_hard = False
-            if sealed_hard and entry != 'filled':
+            if sealed_hard:
                 skipped.append((r, '一字涨停（全天无低于涨停价的成交）→买不到' if v2
-                                else '尾盘已封死涨停，排板未必成交'))
+                                else '尾盘已封死涨停，买不到'))
                 continue
             if idx + 1 >= len(series):
                 skipped.append((r, '次日无K线(未成交/停牌)'))
@@ -445,7 +417,7 @@ def simulate(months: int = 3, capital: float = 100000.0, since: Optional[str] = 
              auction_max_gap: float = 5.0, whole_lots: bool = True,
              with_benchmark: bool = False, sizing: Optional[bool] = None,
              sizing_opts: Optional[Dict] = None) -> Dict:
-    """一次算完六种口径（三种入口 × 两种卖法），给页面用。
+    """一次算完两条真实成交口径（尾盘买 × 开盘卖/尾盘卖），给页面用。
 
     默认窗口=近 3 个月（与用户提的问题一致）；`since` 可以指定起始日。
     全程只读两个 SQLite 库，耗时约 0.2s（基准背景另加 ~2.5s，默认不算）。
@@ -467,7 +439,7 @@ def simulate(months: int = 3, capital: float = 100000.0, since: Optional[str] = 
         'curves': [],
         'generatedAt': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
-    for entry in ('tailclose', 'auction', 'filled'):
+    for entry in ('tailclose',):
         for mode in ('open', 'close'):
             out['curves'].append(_curve_stats(entry, mode, recs, bars, capital,
                                               auction_max_gap, whole_lots,
@@ -710,10 +682,10 @@ def benchmark(since: str) -> Dict:
         conn.close()
 
 
-# ---------- 日常监控：把三入口曲线变成每天一个点 ----------
+# ---------- 日常监控：把真实成交曲线变成每天一个点 ----------
 #
 # 为什么要有这张表（2026-10-18，实施计划 P0-0）：路线图里所有"放宽/多推/改模式"的提案，
-# 判据都写成"rec_sim auction 口径不恶化"。但 simulate() 是一次性现算的，
+# 判据都写成"rec_sim 真实成交口径不恶化"。但 simulate() 是一次性现算的，
 # 没有历史点就没法回答"上周那次改动之后有没有恶化"——只能重新跑一遍，
 # 而重新跑用的是**今天为止的全部推荐**，窗口一直在动，前后两天的数字根本不可比。
 # 所以每天固定时刻算一次、把窗口和数字一起存下来，之后的比较才有同一个基准。
@@ -740,7 +712,7 @@ _DDL_DAILY = '''CREATE TABLE IF NOT EXISTS rec_sim_daily (
 
 
 def record_daily(capital: float = 100000.0, months: int = 3) -> Dict:
-    """每日跑一次六种口径并落库（同一 run_date 重跑覆盖自己）。返回摘要。"""
+    """每日跑一次两条真实成交口径并落库（同一 run_date 重跑覆盖自己）。返回摘要。"""
     from db.database import get_db_conn
     now = datetime.now()
     run_date = now.strftime('%Y-%m-%d')
@@ -761,18 +733,19 @@ def record_daily(capital: float = 100000.0, months: int = 3) -> Dict:
     finally:
         conn.close()
     head = {c['key']: c for c in res['curves']}
-    a, b = head.get('auction_open'), head.get('tailclose_open')
-    sealed = sum(v for k, v in ((b.get('skipReasons') or {}).items()) if '封死' in k) if b else 0
-    summary = (f"auction开盘卖 {a['retPct']:+.2f}%（{a['trades']}笔）vs "
-               f"尾盘硬吃 {b['retPct']:+.2f}%（{b['trades']}笔，其中 {sealed} 条推荐时已封死=买不到）"
-               if a and b else '无数据')
+    o, c = head.get('tailclose_open'), head.get('tailclose_close')
+    sealed = sum(v for k, v in ((o.get('skipReasons') or {}).items())
+                 if '一字' in k or '封死' in k) if o else 0
+    summary = (f"真实成交·开盘卖 {o['retPct']:+.2f}%（{o['trades']}笔，"
+               f"{sealed} 条一字封死买不到）／尾盘卖 "
+               f"{c['retPct']:+.2f}%（{c['trades']}笔）" if o and c else '无数据')
     print(f'[可成交性监控] {run_date} 窗口 {res["window"]["since"]}~{res["window"]["until"]}：{summary}')
     return {'runDate': run_date, 'summary': summary, 'curves': len(rows),
             'window': res['window']}
 
 
 def daily_history(days: int = 40) -> List[Dict]:
-    """最近的每日监控点（前端画"入口口径差"随时间的走势用）。"""
+    """最近的每日监控点（前端画真实成交口径收益随时间的走势用）。"""
     from db.database import get_db_conn
     conn = get_db_conn()
     try:

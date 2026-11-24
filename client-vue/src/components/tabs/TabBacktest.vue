@@ -12,23 +12,16 @@
       </div>
     </div>
 
-    <div v-if="loading" class="bt-loading">正在按六种口径重放历史推荐…（首次约 1 秒，之后半小时走缓存）</div>
+    <div v-if="loading" class="bt-loading">正在按真实成交口径重放历史推荐…（首次约 1 秒，之后半小时走缓存）</div>
     <div v-else-if="error" class="bt-error">{{ error }}</div>
 
     <template v-else>
       <div class="bt-kpis">
         <div class="bt-kpi">
-          <span class="bt-kpi-k">能操作的那条（尾盘买·封板剔除）· 次开卖</span>
+          <span class="bt-kpi-k">真实成交口径（一字封死买不到就剔除）· 次日开盘卖</span>
           <span class="bt-kpi-v" :class="signCls(head.retPct)">{{ fmt(head.end) }}</span>
           <span class="bt-kpi-x" :class="signCls(head.retPct)"
             >{{ pct(head.retPct) }} ｜ vs 背景 {{ vsBenchTxt(head) }}</span
-          >
-        </div>
-        <div class="bt-kpi">
-          <span class="bt-kpi-k">按推荐执行（封板票也当买到了）· 次开卖</span>
-          <span class="bt-kpi-v" :class="signCls(head2.retPct)">{{ fmt(head2.end) }}</span>
-          <span class="bt-kpi-x" :class="signCls(head2.retPct)"
-            >{{ pct(head2.retPct) }} ｜ vs 背景 {{ vsBenchTxt(head2) }}</span
           >
         </div>
         <div class="bt-kpi">
@@ -108,10 +101,9 @@
             <button class="bt-mini" @click="readIdx = null">清除</button>
           </template>
           <span v-else class="bt-read-hint"
-            >在图上点一下可以看任意一天的余额。颜色＝卖法（青＝次日开盘卖，橙＝次日尾盘卖），
-            线型＝入口（实线＝按推荐执行，虚线＝尾盘买不到就剔除，点线＝排板全成交的上界，现实做不到）。
-            首屏默认画三条：<b>虚线（尾盘买·封板剔除）是你真能操作的那条</b>，实线把"封板买不到"也当成买到了，
-            点线只是上界——三条都在线上，别看错成"策略赚不到钱"，也别把点线当预期。</span
+            >在图上点一下可以看任意一天的余额。只保留<b>真实能买进卖出</b>的两条线：
+            青＝次日开盘卖、橙＝次日尾盘卖；一字封死买不到就剔除，次日一字跌停卖不掉就顺延。
+            虚线/点线是上午档/下午档拆批次对照，不参与主曲线结论。</span
           >
         </div>
 
@@ -191,18 +183,19 @@
             <thead>
               <tr>
                 <th>日期</th>
-                <th>按推荐执行·开盘卖</th>
-                <th>尾盘硬吃·开盘卖</th>
-                <th>入口差</th>
+                <th>真实成交·开盘卖</th>
+                <th>真实成交·尾盘卖</th>
+                <th>卖法差</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="d in daily.slice(-7).reverse()" :key="d.date">
                 <td>{{ d.date.slice(5) }}</td>
-                <td :class="signCls(d.auction)">{{ d.auction === null ? '—' : pct(d.auction) }}</td>
-                <td :class="signCls(d.tailclose)">{{ d.tailclose === null ? '—' : pct(d.tailclose) }}</td>
-                <td v-if="d.auction !== null && d.tailclose !== null" :class="signCls(d.auction - d.tailclose)">
-                  {{ pct(d.auction - d.tailclose) }}
+                <td :class="signCls(d.tailcloseOpen)">{{ d.tailcloseOpen === null ? '—' : pct(d.tailcloseOpen) }}</td>
+                <td :class="signCls(d.tailcloseClose)">{{ d.tailcloseClose === null ? '—' : pct(d.tailcloseClose) }}</td>
+                <td v-if="d.tailcloseOpen !== null && d.tailcloseClose !== null"
+                  :class="signCls(d.tailcloseOpen - d.tailcloseClose)">
+                  {{ pct(d.tailcloseOpen - d.tailcloseClose) }}
                 </td>
                 <td v-else>—</td>
               </tr>
@@ -211,7 +204,7 @@
           <p v-else class="bt-fine">
             为什么要每天存一个点而不是每次现算：现算用的是"今天为止的全部推荐"，窗口天天在动，
             前两天的数字放在一起根本不可比。所有"放宽过滤 / 多推 / 改模式"的提案，
-            验收标准都写成这一列（按推荐执行口径不恶化），没有这条序列就没有判据。
+            验收标准都写成这一列（真实成交口径不恶化），没有这条序列就没有判据。
           </p>
         </div>
       </section>
@@ -361,7 +354,7 @@
 
       <section class="bt-card">
         <details class="bt-det">
-          <summary>六种口径的数字与"为什么这些数不能当承诺"</summary>
+          <summary>两条真实成交口径的数字与"为什么这些数不能当承诺"</summary>
           <table class="bt-table">
             <thead>
               <tr>
@@ -391,12 +384,12 @@
             </tbody>
           </table>
           <div class="bt-why">
-            <p><b>三条会骗人的地方，这里都按"现实里做不到就不算"处理：</b></p>
+            <p><b>只算现实里做得到的成交，三条判据如下：</b></p>
             <ul>
               <li>
-                尾盘已经封死涨停的票<b>买不到</b>。系统偏爱强势票，{{ metaRec }} 条里有 {{ sealedCount }} 条当天封死；
-                把这些当成"我买到了"，三个月能从 <b>{{ pct(byKey('tailclose_open').retPct) }}</b> 变成
-                <b>{{ pct(byKey('filled_open').retPct) }}</b> —— 这种"改进"是假的。
+                一字封死涨停（全天最低价都没低于涨停价）的票<b>买不到</b>，直接剔除并计数：
+                {{ metaRec }} 条里有 {{ sealedCount }} 条一字封死。盘中炸过板、出现过真实可买价的才算买进，
+                买入价取当日真实存在过的推荐记录价或复权收盘价。已删除"封板也当买到""排板全成交"两条假设口径。
               </li>
               <li>次日一字跌停<b>卖不掉</b>，曲线里顺延到下一根K线才成交（一鸣食品 09-01 那种连吃两个一字）。</li>
               <li>
@@ -428,17 +421,9 @@
           </summary>
           <template v-if="excess && excess.byDay['1']">
             <div class="bt-fine">
-              {{ excess.feeModel || '双边费用按模拟器费率' }}；滑点情景：
-              <select v-model.number="slippageBps" @change="loadExcess">
-                <option :value="0">0 bp/边（理想成交）</option>
-                <option :value="10">10 bp/边（默认假设）</option>
-                <option :value="20">20 bp/边（较保守假设）</option>
-              </select>
-              当前结果：{{
-                excess.slippageBpsPerSide == null
-                  ? '服务端未返回滑点口径'
-                  : `${excess.slippageBpsPerSide} bp/边（假设值，非实测）`
-              }}；买价上浮、卖价下调。
+              {{ excess.feeModel || '双边费用按模拟器费率' }}；
+              2026-11-24 起本页<b>不设滑点假设</b>（0 bp/边，买价不浮、卖价不压）；
+              推荐与基准同口径配对，结论不依赖滑点档位（0/10/20 bp 的超额几乎相同）。
             </div>
             <table class="bt-table bt-ex-table">
               <thead>
@@ -469,20 +454,20 @@
                 这条回答的是"<b>这些票拿几天到底行不行</b>"，买价统一用<b>推荐日下一交易日开盘</b>， 不是推荐时的参考价
                 —— 后者混着推荐当天已经涨过的那段，算出来会好看得不真实。
                 基准是选股范围内<b>全部票</b>在同一买入日、同一持有期等权，逐条配对后平均，
-                所以超额不是"策略均值减指数涨幅"这种假 alpha。推荐与基准应用同一套手续费及双边滑点情景。
+                所以超额不是"策略均值减指数涨幅"这种假 alpha。推荐与基准应用同一套手续费，不设滑点假设。
               </p>
               <p class="bt-fine">
                 窗口 {{ excess.since }} ~ {{ excess.until }} / {{ excess.recCount }} 条推荐 （固定 6
-                个月，与上方曲线窗口无关）；当日封死涨停的票按"次日竞价能买"处理， 次日一字涨停买不到跳过
+                个月，与上方曲线窗口无关）；买入价＝推荐日下一交易日真实开盘价，次日一字涨停（全天无可买价）跳过
                 {{ excess.skipped['次日一字涨停买不到'] || 0 }} 条， 其余 K 线不足的样本单独计数、不进分母。
               </p>
               <p v-if="monthly5" class="bt-fine">逐月 5 日超额：{{ monthly5 }}</p>
               <p class="bt-fine">
                 负超额的意思很直接：这批推荐次日开盘追进去、拿住，扣完费还不如同日买范围内一篮子。
-                它和上面六条曲线不矛盾 —— 上面回答"次日就卖"，这里回答"拿几天"。
+                它和上面两条曲线不矛盾 —— 上面回答"次日就卖"，这里回答"拿几天"。
               </p>
               <p class="bt-fine">
-                历史基准股票范围按当前选股范围回看，存在幸存者偏差；滑点为情景假设，不是逐笔实测。
+                历史基准股票范围按当前选股范围回看，存在幸存者偏差；成交价取真实开盘/收盘，不是逐笔成交回报。
                 前向样本仍需单独验证后才能判断策略是否有稳定超额。
               </p>
             </div>
@@ -553,7 +538,7 @@
   const readIdx = ref(null)
   const excess = ref(null) // 次日开盘持有 N 日的可执行超额（独立接口，后到）
   const excessError = ref('')
-  const slippageBps = ref(10)
+  const slippageBps = ref(0) // 不设滑点假设；0/10/20bp 超额本就几乎相同
   const lab = ref(null) // 最近一次因子体检（每周六离线跑）
   const labError = ref('')
   const benchLoading = ref(false) // 同期等权背景单独要 2~3 秒，先出曲线再后台补它
@@ -569,27 +554,19 @@
   // 颜色只表达"卖法"，线型表达"入口"。A股是红涨绿跌，所以红/绿这两个语义色
   // 一律留给数字本身（赚了红、亏了绿），曲线不碰它们，免得看图的人在颜色上读反。
   const HUE = { open: 'var(--accent-info)', close: 'var(--accent-warning)' }
-  // am/pm＝上午档/下午档拆批次线（2026-10-21）：虚线区分末批实线，颜色仍按卖法
-  const DASH = { auction: null, tailclose: '6 3', filled: '2 3', am: '9 3', pm: '2 3' }
+  // am/pm＝上午档/下午档拆批次线（2026-10-21）：虚线/点线只用来区分拆档，不参与主曲线结论
+  const DASH = { tailclose: null, am: '9 3', pm: '2 3' }
   const linestyleOf = c =>
-    c.entry === 'tailclose' || c.entry === 'am'
-      ? 'dashed'
-      : c.entry === 'filled' || c.entry === 'pm'
-        ? 'dotted'
-        : 'solid'
+    c.entry === 'am' ? 'dashed' : c.entry === 'pm' ? 'dotted' : 'solid'
 
   const curves = computed(() => (data.value && data.value.curves) || [])
   const batchNote = ref('')
   const shown = ref(new Set())
   const visible = computed(() => curves.value.filter(c => shown.value.has(c.key)))
   const byKey = k => curves.value.find(c => c.key === k) || { retPct: 0, end: capital, nav: [], mdd: 0 }
-  // 首屏默认画哪几条（2026-11-02 改）：接口给的 `default` 标的是两条"按推荐执行"（auction_*），
-  // 而那两条把"封板买不到"也算进仓位，一进来就是两条 −25% 以下的下线，读不出"真能操作的那条"
-  // 其实只亏 1~2 个点。所以首屏固定三条：能操作的（尾盘买、封板剔除）→ 按推荐执行（含买不到）→
-  // 排板全成交（上界，现实做不到）。图例仍可自由开关，这里只决定第一次看到什么。
-  const PRIOR_SHOWN = ['tailclose_open', 'auction_open', 'filled_open']
-  const head = computed(() => byKey('tailclose_open')) // 主卡＝真能操作的那条
-  const head2 = computed(() => byKey('auction_open')) // 次卡＝按推荐执行（含买不到的）
+  // 2026-11-24：假设口径（auction/filled）已从引擎与页面彻底删除，首屏只画两条真实成交曲线。
+  const PRIOR_SHOWN = ['tailclose_open', 'tailclose_close']
+  const head = computed(() => byKey('tailclose_open')) // 主卡＝唯一可执行的买入口径
   const bench = computed(() =>
     data.value && data.value.benchmark && data.value.benchmark.available ? data.value.benchmark : null
   )
@@ -610,7 +587,7 @@
   const sealedCount = computed(() => {
     const s = byKey('tailclose_open').skipReasons || {}
     return Object.entries(s)
-      .filter(([k]) => k.includes('封死'))
+      .filter(([k]) => k.includes('一字') || k.includes('买不到'))
       .reduce((a, [, v]) => a + v, 0)
   })
 
@@ -618,9 +595,11 @@
   const daily = computed(() => {
     const by = {}
     ;(data.value.daily || []).forEach(r => {
-      const d = (by[r.run_date] = by[r.run_date] || { date: r.run_date, auction: null, tailclose: null })
-      if (r.mode === 'open' && r.entry === 'auction') d.auction = r.ret_pct
-      if (r.mode === 'open' && r.entry === 'tailclose') d.tailclose = r.ret_pct
+      const d = (by[r.run_date] = by[r.run_date] || {
+        date: r.run_date, tailcloseOpen: null, tailcloseClose: null
+      })
+      if (r.mode === 'open' && r.entry === 'tailclose') d.tailcloseOpen = r.ret_pct
+      if (r.mode === 'close' && r.entry === 'tailclose') d.tailcloseClose = r.ret_pct
     })
     return Object.values(by).sort((a, b) => (a.date < b.date ? -1 : 1))
   })

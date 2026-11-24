@@ -260,9 +260,11 @@ STRATEGY_SCORE_VALUES = {
 # rps/fundamental/smart_money 三因子数据源零样本（strategy_factor_weights 里 sample_count=0），
 # 每票都吃 no_data 分却占归一化分母 ~29%，系统性压低总分。
 # True=主链也摘掉（上线动作）；False=主链现状不变（逐字节等于现状），
-# 影子臂 alt_total 恒算（纯算术零 IO）随 stock['score'] 进 recommendation_batches.stocks_json 留痕，
-# 20 个交易日后按可成交净期望 + 最深回撤裁决再定是否翻 True。
-STRATEGY_ZERO_SAMPLE_EXCLUDE = False
+# 影子臂 alt_total 恒算（纯算术零 IO）随 stock['score'] 进 recommendation_batches.stocks_json 留痕。
+# 2026-11-24 用户拍板翻 True：rps/fundamental/smart_money 三因子 sample_count=0 至今（自 09-04
+# 权重冻结），三因子恒吃 no_data 分却占归一化分母约 29%，系统性压低所有票总分。属 holdout 窗内
+# 经用户明确授权的策略变更，样本外验证从此不干净——如实记录，不伪装成裁决通过。
+STRATEGY_ZERO_SAMPLE_EXCLUDE = True
 
 
 # ========== 策略委比验证配置 ==========
@@ -334,7 +336,7 @@ DEFAULT_WEIGHTS = {
     'amplitude': 0.9,            # 振幅：高振幅既有机会也有风险，1.0→0.9
     'position': 1.0,             # 仓位建议：已含 PE+涨幅组合，保持
     'main_capital_inflow': 1.3,  # 主力净流入：市面强调"连续3日净流入+占流通市值≥0.5%"，1.0→1.3
-    'holder_structure': 1.2,     # 筹码集中度：股东人数筹码面，月度数据有滞后，1.0→1.2
+    'holder_structure': 1.0,     # 筹码集中度：股东人数筹码面，月度数据有滞后；2026-11-24 用户拍板 1.2→1.0（数据与短周期因子同权，不过度加权滞后数据）
     'rps': 1.1,                  # RPS 相对强度：欧奈尔核心因子，强于90%个股给高分，1.0→1.1
     'fundamental': 1.0,          # 基本面质量：ROE+净利润增速，季度数据，质量防护维度
     'smart_money': 0.6,          # 聪明钱：龙虎榜净买+北向，纯加分信号（权重略低避免单一事件主导）
@@ -373,7 +375,10 @@ WESTOCK_UNIVERSE_CAP = 200           # 宇宙封顶（fund flow 单批 10 只，
 # 结论：修 bug 恢复的是"策略能自我纠错 + 回测可观测"，不等于胜率立刻提升——
 # 所以先影子运行（调整明细照样写进回测报告的 weight_adjustments，但不落权重），
 # 攒几天对照后把本开关改 True 才真正让线上评分吃到权重学习。
-FACTOR_WEIGHT_LEARNING_ENABLED = False
+# 2026-11-24 用户拍板翻 True：权重表自 09-04 冻结 40+ 天，近 90 天 IC 显示 change_percent IR +0.34 /
+# main_capital_inflow +0.30 宜增权、amplitude IR −0.40 宜降权。属 holdout 窗内经用户明确授权的
+# 策略变更，此后 auto_optimizer 会持续改写线上 13 因子权重；样本外验证从此不干净，如实记录。
+FACTOR_WEIGHT_LEARNING_ENABLED = True
 
 # ========== 抗跌因子（2026-11-07，修⑥①，只记录不进门槛）==========
 # 选股 alpha≈0 已证（10-23 真推荐开盘口径 1/3/5/10 日超额全负），卖出侧更值得做，

@@ -183,8 +183,8 @@ print('\n[8] 默认出口提醒（2026-11-11 方向 1）：数字活取、缺数
 # 8a 注入对照数：文案带实测数与样本窗，不写死
 _R8 = R.exit_sim_rates
 R.exit_sim_rates = lambda: {
-    'filled_open': {'avg': 0.8, 'win': 52.4, 'n': 103, 'since': '2026-08-09', 'until': '2026-11-10'},
-    'filled_close': {'avg': -0.55, 'win': 43.7, 'n': 103, 'since': '2026-08-09', 'until': '2026-11-10'}}
+    'tailclose_open': {'avg': 0.8, 'win': 52.4, 'n': 103, 'since': '2026-08-09', 'until': '2026-11-10'},
+    'tailclose_close': {'avg': -0.55, 'win': 43.7, 'n': 103, 'since': '2026-08-09', 'until': '2026-11-10'}}
 n8 = R._default_exit_note()
 ck('次日 9:15-9:25 竞价挂卖' in n8 and '+0.80%' in n8 and '52.4%' in n8
    and '-0.55%' in n8 and '43.7%' in n8 and '2026-08-09' in n8 and '103' in n8,
@@ -194,22 +194,22 @@ ck('None' not in n8, '有数时不许出现 None')
 R.exit_sim_rates = lambda: {}
 n8b = R._default_exit_note()
 ck('次日 9:15-9:25 竞价挂卖' in n8b and '回测页' in n8b and 'None' not in n8b
-   and '可成交模拟（' not in n8b, '缺数：只给纪律与看数位置，不编数字')
+   and '真实成交口径（' not in n8b, '缺数：只给纪律与看数位置，不编数字')
 # 8c 反证：缺一条腿/坏值（None）不许渲染成 "None%"，也不许硬凑另一腿
-R.exit_sim_rates = lambda: {'filled_open': {'avg': 0.8, 'win': 52.4, 'n': 103,
-                                            'since': 's', 'until': 'u'}}
+R.exit_sim_rates = lambda: {'tailclose_open': {'avg': 0.8, 'win': 52.4, 'n': 103,
+                                               'since': 's', 'until': 'u'}}
 n8c = R._default_exit_note()
 ck('；拿到次日收盘' not in n8c and 'None' not in n8c, '缺收盘腿：不硬凑、不出 None')
-R.exit_sim_rates = lambda: {'filled_open': {'avg': None, 'win': 52.4, 'n': 103,
-                                            'since': 's', 'until': 'u'},
-                            'filled_close': {'avg': -0.55, 'win': 43.7, 'n': 103,
-                                             'since': 's', 'until': 'u'}}
+R.exit_sim_rates = lambda: {'tailclose_open': {'avg': None, 'win': 52.4, 'n': 103,
+                                               'since': 's', 'until': 'u'},
+                            'tailclose_close': {'avg': -0.55, 'win': 43.7, 'n': 103,
+                                                'since': 's', 'until': 'u'}}
 n8d = R._default_exit_note()
-ck('None' not in n8d and '可成交模拟（' not in n8d, '反证：开盘腿均值是 None → 整体退回定性')
+ck('None' not in n8d and '真实成交口径（' not in n8d, '反证：开盘腿均值是 None → 整体退回定性')
 R.exit_sim_rates = _R8
 # 8e 缓存新鲜时不重算（与 exec_rates 同节奏）
-R._EXIT_SIM_CACHE.update({'ts': _t.time() + 9999, 'data': {'filled_open': {'avg': 1.0}}})
-ck(R.exit_sim_rates() == {'filled_open': {'avg': 1.0}}, '出口对照数缓存新鲜时不重读库')
+R._EXIT_SIM_CACHE.update({'ts': _t.time() + 9999, 'data': {'tailclose_open': {'avg': 1.0}}})
+ck(R.exit_sim_rates() == {'tailclose_open': {'avg': 1.0}}, '出口对照数缓存新鲜时不重读库')
 R._EXIT_SIM_CACHE.update({'ts': 0.0, 'data': {}})
 # 8f 封板票 exitNote 一字不动（子集口径等 exit_seal 分叉裁决，本批不碰）
 bsp8 = R.calc_buy_sell_points(cases[0][1], score_result={'total': 72, 'label': 'B',

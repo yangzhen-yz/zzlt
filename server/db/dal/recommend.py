@@ -262,21 +262,23 @@ def load_recommendation_batches(rec_date: str = '') -> List[Dict]:
         cursor = conn.cursor()
         if rec_date:
             rows = cursor.execute(
-                'SELECT id, rec_date, batch_time, source, stock_count, stocks_json '
+                'SELECT id, rec_date, batch_time, source, stock_count, payload_hash, stocks_json '
                 'FROM recommendation_batches WHERE rec_date=? ORDER BY id', (rec_date,)).fetchall()
         else:
             rows = cursor.execute(
-                'SELECT id, rec_date, batch_time, source, stock_count, stocks_json '
+                'SELECT id, rec_date, batch_time, source, stock_count, payload_hash, stocks_json '
                 'FROM recommendation_batches ORDER BY id').fetchall()
         conn.close()
         out = []
         for r in rows:
             try:
-                stocks = json.loads(r[5] or '[]')
+                stocks = json.loads(r[6] or '[]')
             except Exception:
                 stocks = []
+            # payload_hash（2026-11-23）：写入侧只跟当日最后一批比，非连续重放同内容
+            # 会多留一行。读取侧带出指纹，统计"当天到底推了几次"时按它去重才不虚高。
             out.append({'id': r[0], 'date': r[1], 'batch_time': r[2], 'source': r[3],
-                        'stock_count': r[4], 'stocks': stocks})
+                        'stock_count': r[4], 'payload_hash': r[5] or '', 'stocks': stocks})
         return out
     except Exception as error:
         print(f'读取推荐批次失败: {str(error)}')

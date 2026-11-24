@@ -696,9 +696,29 @@ async def _get_next_day_change_from_kline(symbol: str, pred_date: str) -> Option
         次日涨跌幅(%)，如无法获取返回 None
     """
     try:
-        kline = await get_kline_data(symbol.lower())
+        # 2026-11-23：优先读本地日K库（349 万行、已到当日），本地缺票或缺该
+        # 日期段才回退外部 get_kline_data。东财/腾讯熔断时整批补验不再全军覆没
+        # （11-03 退回的 166 条就卡在这里）。本地 K 线与腾讯 qfqday 同构
+        # ([date,open,close,high,low,volume])，下面按日期找"严格晚于预测日的第一根"
+        # 的逻辑不变——所以本地最新 bar 是今天时，预测日为今天仍返回 None，
+        # 不会拿当日 unfinished bar 冒充次日。外部失败也不再拖垮本地可读的票。
+        kline = None
+        try:
+            from services.data.kline_history import get_engine
+            kline = get_engine().get_kline_tencent_format(symbol.lower(), 640)
+        except Exception as _le:
+            print(f'  [补验] 本地日K不可用，回退外部 {symbol}: '
+                  f'{type(_le).__name__}: {_le}')
+        if not kline or len(kline) < 2:
+            kline = await get_kline_data(symbol.lower())
         if not kline or len(kline) < 2:
             return None
+        # 2026-11-23：本地只留最近 N 根，预测日可能早于最早一根。此时本地
+        # 算不出"次日"，必须回退外部拿更长历史，不能硬拿最早一根冒充。
+        if kline and pred_date < kline[0][0]:
+            kline = await get_kline_data(symbol.lower())
+            if not kline or len(kline) < 2:
+                return None
         # 在K线中找到预测日的位置
         for i, k in enumerate(kline):
             if k[0] == pred_date:

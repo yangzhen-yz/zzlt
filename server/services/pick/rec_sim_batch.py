@@ -1,15 +1,16 @@
 """rec_sim_batch.py - 上午档 vs 下午档的拆批次回测（2026-10-21）
 
 背景：`daily_recommendations` 同一天先删后插、只留最后一批（14:45），所以现有回测曲线
-一直是"下午档"曲线——而下午档推的多是已涨停票、走次日竞价追买，和上午档的"盘中灵活
-低吸"（如 10-21 的 10:26 上工申贝）根本是两种策略，混在一条曲线上互相污染。
+一直是"下午档"曲线——而下午档推的多是已涨停票，和上午档的"盘中灵活低吸"
+（如 10-21 的 10:26 上工申贝）根本是两种策略，混在一条曲线上互相污染。
 `strategy_snapshot` 从 10-19 起每个批次都落了 stage/timing/快照价，拆档名单可以从
 这张表还原（10-19 之前的上午名单已随推荐表覆盖丢失，无法回补——曲线只能从 10-19 攒起）。
 
 口径（与现有曲线共用同一个 rec_sim 引擎，保证可比）：
   · 上午档 = 当天最后一个上午批次（<12:00，如 10:01/10:26）的 recommended 名单；
   · 下午档 = 14:45 名单（缺则取最后一个下午批次）；
-  · 入口统一 'auction'（封板票次日竞价买·高开>5%不追；非封板按记录价当日买）——
+  · 入口统一 'tailclose'：一字封死买不到直接剔除，买入价取推荐记录价（落在当日真实
+    高低区间内）或复权收盘，卖出按真实开盘/收盘价——与页面唯一保留的口径完全一致。
     上午档的"记录价"是**推荐时点快照价**而非低吸撮合价，这是快照没存区间的近似，
     口径差异如实写进 labels.note，不与末批曲线争高下、只看两档相对强弱。
 """
@@ -87,7 +88,7 @@ def simulate_batch(months: int = 3, capital: float = 100000.0,
     }
     for side, recs in (('am', am_recs), ('pm', pm_recs)):
         for mode in ('open', 'close'):
-            c = rec_sim._curve_stats('auction', mode, recs, bars, capital,
+            c = rec_sim._curve_stats('tailclose', mode, recs, bars, capital,
                                      auction_max_gap, whole_lots)
             c['key'] = f'{side}_{mode}'
             c['side'] = side

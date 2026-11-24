@@ -7,8 +7,8 @@
 口径、剔除规则、费用、以及"为什么尾盘封死的票按买不到处理"都写在引擎的文件头里。
 
 用法：
-  python scripts/rec_exit_sim.py                       # 近3个月，六种口径全打
-  python scripts/rec_exit_sim.py --entry tailclose      # 只看某一种入口
+  python scripts/rec_exit_sim.py                       # 近3个月，真实成交两条曲线全打
+  python scripts/rec_exit_sim.py --entry tailclose      # 只看尾盘买（唯一生产口径）
   python scripts/rec_exit_sim.py --since 2026-08-01 --capital 50000
   python scripts/rec_exit_sim.py --bench                # 顺带算同期等权背景（慢 2.5s）
   python scripts/rec_exit_sim.py --detail               # 逐笔明细写 analysis_out/
@@ -22,11 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.pick import rec_sim as S          # noqa: E402
 
-ENTRY_ALIAS = {
-    'tailclose': 'tailclose', '尾盘': 'tailclose',
-    'auction': 'auction', '竞价': 'auction',
-    'filled': 'filled', '全成交': 'filled', 'allow-sealed': 'filled',
-}
+# 2026-11-24：auction（封板也当买到）与 filled（排板全成交）两条假设口径已删除，
+# 不再接受这些别名；传进来会明确报错，而不是静默跑出空结果。
+ENTRY_ALIAS = {'tailclose': 'tailclose', '尾盘': 'tailclose'}
 
 
 def main():
@@ -34,9 +32,9 @@ def main():
     ap.add_argument('--months', type=int, default=3)
     ap.add_argument('--since', default=None)
     ap.add_argument('--capital', type=float, default=100000)
-    ap.add_argument('--entry', default=None, help='只看一种入口：tailclose/auction/filled')
+    ap.add_argument('--entry', default=None, help='只看一种入口：tailclose（假设口径已删除）')
     ap.add_argument('--auction-max-gap', type=float, default=5.0,
-                    help='竞价买入允许的最大高开幅度%%（推荐原文"高开5%%以上不追"；999=不限制）')
+                    help='已废弃的兼容参数：竞价口径删除后对 tailclose 无任何影响')
     ap.add_argument('--no-lots', action='store_true',
                     help='不取整到 100 股（等权满仓的敏感性检验，看整股噪声贡献了多少）')
     ap.add_argument('--bench', action='store_true', help='算同期等权背景（多花约 2.5 秒）')
@@ -44,6 +42,8 @@ def main():
     args = ap.parse_args()
 
     want = ENTRY_ALIAS.get(args.entry, args.entry) if args.entry else None
+    if want and want not in ('tailclose', 'paiban'):
+        raise SystemExit(f'入口 {args.entry!r} 已随假设口径一并删除，现只支持 tailclose')
     d = S.simulate(months=args.months, capital=args.capital, since=args.since,
                    auction_max_gap=args.auction_max_gap, whole_lots=not args.no_lots,
                    with_benchmark=args.bench)
@@ -52,7 +52,8 @@ def main():
           f"（全部来自 14:45 收盘前快照）；日K最新到 {w['lastKlineDate']}")
     print(f"本金 {args.capital:,.0f} 元；分仓＝当日可用现金按推荐只数均分、100 股一手"
           f"{'（已放开整股）' if args.no_lots else ''}；"
-          f"费用＝买卖佣金万五(单边最低5元)+印花税万五(卖)+过户万0.1；竞价纪律＝高开≤{args.auction_max_gap:g}%才追")
+          f"费用＝买卖佣金万五(单边最低5元)+印花税万五(卖)+过户万0.1；"
+          f"一字封死买不到直接剔除，无假设成交口径")
     if d.get('benchmark', {}).get('available'):
         b = d['benchmark']
         print(f"同期背景（事后信息，只看行情冷热）：{b['from']}→{b['to']}，{b['count']} 只等权 {b['avgPct']:+.2f}%")
@@ -73,7 +74,7 @@ def main():
         if c['skipReasons']:
             print(f"    跳过构成：{c['skipReasons']}")
         if c['notes']:
-            print(f"    带口径提示的成交 {len(c['notes'])} 笔（除权越界/一字顺延/竞价买入）")
+            print(f"    带口径提示的成交 {len(c['notes'])} 笔（除权越界/一字顺延）")
         if args.detail:
             out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                    'analysis_out')
@@ -86,11 +87,11 @@ def main():
                       ensure_ascii=False, indent=1)
             print(f'    明细已写 {path}')
     if len(ends) >= 2:
-        base = [k for k in ends if k.endswith('_open') and k.startswith('auction')]
-        alt = [k for k in ends if k.endswith('_close') and k.startswith('auction')]
+        base = [k for k in ends if k.endswith('_open') and k.startswith('tailclose')]
+        alt = [k for k in ends if k.endswith('_close') and k.startswith('tailclose')]
         if base and alt:
             diff = ends[base[0]] - ends[alt[0]]
-            print(f"\n按推荐执行这一口径下，开盘卖比尾盘卖多 {diff:+,.0f} 元"
+            print(f"\n真实成交口径下，开盘卖比尾盘卖多 {diff:+,.0f} 元"
                   f"（{diff / args.capital * 100:+.2f} 个点）")
 
 
