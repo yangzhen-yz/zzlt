@@ -2390,6 +2390,15 @@ body {
   font-family: 'SF Mono', 'Cascadia Mono', 'Consolas', 'JetBrains Mono', monospace;
 }
 
+/* 今日推荐卡片显示实时现价时的角标（2026-11-23），与"推荐时价"区分 */
+.recommend-price-live {
+  font-size: 0.65rem;
+  font-weight: 600;
+  opacity: 0.75;
+  margin-left: 0.3em;
+  vertical-align: middle;
+}
+
 .recommend-stats-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

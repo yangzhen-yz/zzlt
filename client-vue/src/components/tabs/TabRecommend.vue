@@ -180,9 +180,10 @@
           </div>
           <div
             class="recommend-price-large"
-            :style="{ color: r.change >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }"
+            :style="{ color: (r.currentChangePercent ?? r.change) >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }"
           >
-            {{ r.price }}
+            {{ r.currentPrice || r.price }}
+            <span v-if="r.currentPrice" class="recommend-price-live">现价</span>
           </div>
         </div>
         <div class="recommend-stats-grid">
@@ -190,8 +191,10 @@
             <span class="recommend-stat-label">今日涨跌</span>
             <span
               class="recommend-stat-value"
-              :style="{ color: r.change >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }"
-              >{{ r.change >= 0 ? '+' : '' }}{{ r.changePercent?.toFixed(2) || 0 }}%</span
+              :style="{ color: (r.currentChangePercent ?? r.change) >= 0 ? 'var(--accent-danger)' : 'var(--accent-success)' }"
+              >{{ (r.currentChangePercent ?? r.change) >= 0 ? '+' : '' }}{{
+                (r.currentChangePercent ?? r.changePercent)?.toFixed(2) || 0
+              }}%</span
             >
           </div>
           <div class="recommend-stat-box">
