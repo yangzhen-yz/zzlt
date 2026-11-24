@@ -213,12 +213,19 @@ async def async_swr_get(store: Dict, key: Any,
                         coro_factory: Callable[[], Awaitable[Any]], *,
                         ttl: float, stale_max: float, label: str,
                         gap: float = 30.0,
-                        max_keys: Optional[int] = None) -> Tuple[Any, str]:
+                        max_keys: Optional[int] = None,
+                        cacheable: bool = True) -> Tuple[Any, str]:
     """协程版 SWR。必须在事件循环里 await；返回 (data, state)。
 
     用于「本来就是 async、单次 1~3 秒、数据分钟级变化」的只读接口：
     过期立即返旧值，刷新作为独立 task 挂在主 loop 上，请求本身不受影响。
+
+    `cacheable=False`（2026-11-23，与同步版 `swr_get` 同语义）：既不读也不写缓存、
+    每次现算。给参数白名单用——白名单外的组合不入表，才不会让垃圾参数把前端
+    真正在用的缓存槽挤出去（同步版三处回测接口切过来时必须带这个参数）。
     """
+    if not cacheable:
+        return await coro_factory(), 'cold'
     now = time.time()
     hit = store.get(key)
     if isinstance(hit, dict):

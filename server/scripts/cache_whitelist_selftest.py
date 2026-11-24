@@ -366,9 +366,15 @@ _s_src = open(os.path.join(HERE, '..', 'app', 'api', 'routers', 'scan.py'),
               encoding='utf-8').read()
 ck('hot_scan_key(' in _s_src and 'code_key(' not in _s_src.split('hot_scan_key')[0][-200:],
    '热扫描走标准化短键（§8.7 第 1 名，已收口）')
-_n_calls = (_r_src.count('swr_get(_REC_SIM_CACHE') + _r_src.count('swr_get(_EXCESS_CACHE'))
+# 11-23 起这三处已由同步 swr_get 改成 await _swr.async_swr_get（冷算进子线程），
+# 两种形态都算调用点，守卫不能只认旧的 swr_get( 字面串，否则重构后数到 0 会假红。
+_n_calls = (
+    _r_src.count('swr_get(_REC_SIM_CACHE') + _r_src.count('swr_get(_EXCESS_CACHE')
+    + _r_src.count('async_swr_get(\n            _REC_SIM_CACHE')
+    + _r_src.count('async_swr_get(\n            _EXCESS_CACHE')
+)
 ck(_rec_cacheable_count + int(_excess_cacheable) == _n_calls,
-   f'每一处 swr_get(缓存表 …) 都带白名单：{ _n_calls} 处调用')
+   f'每一处 swr_get/async_swr_get(缓存表 …) 都带白名单：{ _n_calls} 处调用')
 
 print(f'\n结果：{len(PASS)} 通过 / {len(FAIL)} 失败')
 if FAIL:

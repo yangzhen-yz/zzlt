@@ -900,7 +900,7 @@ def run_scheduler(register_only: bool = False):
 
     def job_rec_sim_daily():
         """可成交性日常监控（2026-10-18，实施计划 P0-0）：推荐复盘之后跑，
-        把"同一批推荐在三种入口口径下各值多少钱"存成每天一个点。
+        把"同一批推荐在真实成交口径下值多少钱"存成每天一个点。
 
         非交易日也跑没意义（推荐记录不会新增、日K也没变），所以只交易日跑；
         但它**不依赖任何网络**，失败也只是少一个监控点，不影响任何链路。
@@ -1391,6 +1391,23 @@ def run_scheduler(register_only: bool = False):
                 p = subprocess.Popen([sys.executable, '-u', script, '--mode', mode],
                                      cwd=server_dir, stdout=fh, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, creationflags=flags)
+
+            def _on_exit(rc, _p=p, _mode=mode):
+                # 2026-11-23：原来只拉起不看结果，备份失败无人知晓。脚本自身
+                # 已有 manifest.check + 告警，这里兜住"脚本没跑起来/崩溃"的情况。
+                if rc == 0:
+                    return
+                try:
+                    from services.ops.alert_throttle import push_non_stock_alert
+                    push_non_stock_alert(
+                        f'[数据库备份异常] 03:30 {_mode} 备份子进程退出码={rc}\n'
+                        f'日志 analysis_out/db_backup.log（脚本可能未启动或异常崩溃）',
+                        source='db_backup_exit')
+                except Exception as e:
+                    print(f'[定时任务] 备份退出码告警失败: {type(e).__name__}: {e}')
+
+            threading.Thread(target=lambda: (_p.wait(), _on_exit(_p.returncode)),
+                             daemon=True, name='db-backup-exit-watch').start()
             print(f'[定时任务 {datetime.now():%H:%M:%S}] 数据库自动备份已拉起'
                   f'（{mode}，pid {p.pid}，日志 analysis_out/db_backup.log）')
         except Exception as e:
@@ -1697,7 +1714,7 @@ def run_scheduler(register_only: bool = False):
     schedule.every().day.at(RECOMMEND_REVIEW_TIME).do(job_recommend_review)
 
     # 可成交性日常监控（2026-10-18，实施计划 P0-0）：推荐复盘之后跑，
-    # 把「同一批推荐在三种入口口径下各值多少钱」存成每天一个点（窗口固定才可比）
+    # 把「同一批推荐在真实成交口径下值多少钱」存成每天一个点（窗口固定才可比）
     schedule.every().day.at(REC_SIM_DAILY_TIME).do(_warp_trading_only(job_rec_sim_daily))
 
     # 上午档/下午档拆批次监控（2026-10-21）：排在日K同步批次（18:15~20:15）之后，

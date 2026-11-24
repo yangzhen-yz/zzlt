@@ -59,8 +59,11 @@ async def refresh_rps_api(period_days: int = RPS_PERIOD_DAYS, limit_codes: int =
             print(f'[RPS] 预计算完成: {res}')
         except Exception as e:
             print(f'[RPS] 预计算失败: {e}')
-    asyncio.create_task(_bg())
-    return {"success": True, "message": "RPS 预计算已在后台启动", "periodDays": period_days}
+    if not spawn_tracked('rps_refresh', _bg):
+        return {"success": True, "message": "RPS 预计算已在运行中（忽略重复触发）",
+                "periodDays": period_days, "started": False}
+    return {"success": True, "message": "RPS 预计算已在后台启动",
+            "periodDays": period_days, "started": True}
 
 
 @router.post("/api/fundamental/refresh", tags=["基本面质量"])
@@ -75,8 +78,19 @@ async def refresh_fundamental_api():
             print('[基本面] 预计算完成')
         except Exception as e:
             print(f'[基本面] 预计算失败: {e}')
-    asyncio.create_task(_bg())
-    return {"success": True, "message": "基本面质量预计算已在后台启动"}
+    if not spawn_tracked('fundamental_refresh', _bg):
+        return {"success": True, "message": "基本面质量预计算已在运行中（忽略重复触发）",
+                "started": False}
+    return {"success": True, "message": "基本面质量预计算已在后台启动", "started": True}
+
+
+@router.get("/api/background-tasks", tags=["运维"])
+async def get_background_tasks_api():
+    """查看手动触发的后台刷新任务状态（2026-11-23）：谁在跑、何时结束、失败原因。
+
+    只回纯数据；进程重启后这张表清空——重启前在跑的任务不会自动恢复，
+    页面可据此提示用户重新触发，而不是以为还在后台跑。"""
+    return background_tasks_status()
 
 
 @router.get("/api/dragon-tiger", tags=["聪明钱"])
@@ -115,8 +129,10 @@ async def refresh_valuation_api():
             print(f'[估值] 预计算完成: {res}')
         except Exception as e:
             print(f'[估值] 预计算失败: {e}')
-    asyncio.create_task(_bg())
-    return {"success": True, "message": "估值分位预计算已在后台启动"}
+    if not spawn_tracked('valuation_refresh', _bg):
+        return {"success": True, "message": "估值分位预计算已在运行中（忽略重复触发）",
+                "started": False}
+    return {"success": True, "message": "估值分位预计算已在后台启动", "started": True}
 
 
 @router.get("/api/valuation", tags=["估值分位"])

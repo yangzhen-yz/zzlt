@@ -230,6 +230,37 @@ ck(len(_cashb) == 1 and _cashb[0]['batchTime'] == '14:59:00',
    f'空仓批次被标 cash（{ [b["batchTime"] for b in _cashb] }）')
 ck(all(b['batchTime'] for b in _bats), '每批都有 batchTime（前端 key 靠它，不能空）')
 
+# ============ [8b] 批次计数按 payload_hash 去重（2026-11-23）============
+print('[8b] 接口 count：rawCount=原始行数、uniqueCount=按指纹去重')
+_bsql = sqlite3.connect(_tmpdb)
+_true_raw = _bsql.execute('SELECT COUNT(*) FROM recommendation_batches WHERE rec_date=?',
+                          (D,)).fetchone()[0]
+_true_hash = _bsql.execute('SELECT COUNT(DISTINCT payload_hash) FROM recommendation_batches '
+                           'WHERE rec_date=?', (D,)).fetchone()[0]
+_bsql.close()
+ck(_data.get('rawCount') == _true_raw,
+   f'rawCount={_true_raw}（实得 {_data.get("rawCount")}）')
+ck(_data.get('uniqueCount') == _true_hash,
+   f'uniqueCount={_true_hash}（实得 {_data.get("uniqueCount")}）')
+ck(all(b.get('payloadHash') for b in _bats), '每批都带 payloadHash（统计去重靠它）')
+
+# 构造"非连续重放同内容"：先插一条与早批同指纹的行，raw 应 +1 而 unique 不变
+_bsql = sqlite3.connect(_tmpdb)
+_early = _bsql.execute('SELECT payload_hash, batch_time, source, stock_count, stocks_json '
+                       'FROM recommendation_batches WHERE rec_date=? ORDER BY id LIMIT 1',
+                       (D,)).fetchone()
+_bsql.execute('INSERT INTO recommendation_batches '
+              '(rec_date, batch_time, source, stock_count, payload_hash, stocks_json) '
+              'VALUES (?,?,?,?,?,?)', (D, '23:59:00', 'replay', _early[3], _early[0], _early[4]))
+_bsql.commit()
+_bsql.close()
+_r2x = asyncio.run(rec.recommend_batches_api(date=D))
+_d2x = (_r2x or {}).get('data') or {}
+ck(_d2x.get('rawCount') == _true_raw + 1,
+   f'重放后 rawCount={_true_raw + 1}（实得 {_d2x.get("rawCount")}）')
+ck(_d2x.get('uniqueCount') == _true_hash,
+   f'重放后 uniqueCount 不变={_true_hash}（实得 {_d2x.get("uniqueCount")}）')
+
 # ============ [9] 11-01 之前：退回快照回看 ============
 print('[9] 11-01 之前的日期没有批次表 → 退回 strategy_snapshot')
 _c3 = sqlite3.connect(_tmpdb)

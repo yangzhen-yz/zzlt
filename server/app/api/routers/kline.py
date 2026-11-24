@@ -155,8 +155,10 @@ async def kline_history_sync_api():
             print("[历史K线] 增量同步 + RPS 刷新完成")
         except Exception as e:
             print(f"[历史K线] 增量同步失败: {e}")
-    asyncio.create_task(_bg())
-    return {"success": True, "message": "本地历史库增量同步已在后台启动"}
+    if not spawn_tracked('kline_sync', _bg):
+        return {"success": True, "message": "本地历史库增量同步已在运行中（忽略重复触发）",
+                "started": False}
+    return {"success": True, "message": "本地历史库增量同步已在后台启动", "started": True}
 
 
 @router.post("/api/kline-history/backfill", tags=["本地历史K线库"])
@@ -180,6 +182,9 @@ async def kline_history_backfill_api(start_date: str = None, limit: int = 0):
             print("[历史K线] 全量回填完成")
         except Exception as e:
             print(f"[历史K线] 全量回填失败: {e}")
-    asyncio.create_task(_bg())
-    return {"success": True, "message": "全市场历史K线回填已在后台启动（约12分钟）"}
+    if not spawn_tracked('kline_backfill', _bg):
+        return {"success": True, "message": "全市场历史K线回填已在运行中（忽略重复触发）",
+                "started": False}
+    return {"success": True, "message": "全市场历史K线回填已在后台启动（约12分钟）",
+            "started": True}
 

@@ -85,7 +85,7 @@ async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
                                 gap: float = 5.0, lots: bool = True, bench: bool = False):
     """历史推荐的钱曲线（2026-10-18，复盘 → 回测曲线子页用）。
 
-    六种口径（三种入口 × 两种卖法）一次算完，实现只在 `services/pick/rec_sim.py` 一份 ——
+    两条真实成交口径（尾盘买 × 次日开盘卖/尾盘卖）一次算完，实现只在 `services/pick/rec_sim.py` 一份 ——
     命令行 `scripts/rec_exit_sim.py` 调的是同一个函数，页面与日志不会出现两套数。
 
     同步的 SQLite 读取全部丢进 `to_thread`：这个接口一次要读 85 只票的完整日K，
@@ -106,11 +106,14 @@ async def get_recommend_sim_api(months: int = 3, capital: float = 100000,
                                 with_benchmark=bench)
 
     try:
-        raw, state = _swr.swr_get(_REC_SIM_CACHE, key, _compute,
-                                  ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
-                                  label='rec-sim', gap=120, max_keys=12,
-                                  cacheable=rec_params_cacheable(months, capital, gap,
-                                                                 lots, bench))
+        # 2026-11-23（后续计划 §1 第 12 条）：cold 分支原来在事件循环里同步跑
+        # （冷参数命中实测 excess 7.4s、review 9.39s，期间连 /api/health 都排队）。
+        # 换 async 版并把同步 compute 丢线程池；fresh/stale 两条路径语义不变。
+        raw, state = await _swr.async_swr_get(
+            _REC_SIM_CACHE, key, lambda: asyncio.to_thread(_compute),
+            ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
+            label='rec-sim', gap=120, max_keys=12,
+            cacheable=rec_params_cacheable(months, capital, gap, lots, bench))
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"回测曲线计算失败: {str(error)}")
     data = dict(raw)                       # 浅拷贝：别把 daily 写回缓存里那份
@@ -163,8 +166,8 @@ async def recommend_batches_api(date: str = ''):
         rb = []
         try:
             rb = conn.execute(
-                'SELECT id, batch_time, source, stocks_json FROM recommendation_batches '
-                'WHERE rec_date=? ORDER BY id', (d,)).fetchall()
+                'SELECT id, batch_time, source, payload_hash, stocks_json '
+                'FROM recommendation_batches WHERE rec_date=? ORDER BY id', (d,)).fetchall()
         except Exception:
             rb = []
         if rb:
@@ -202,6 +205,7 @@ async def recommend_batches_api(date: str = ''):
                 out.append({'batch': bt[:5] or bt, 'batchTime': bt, 'batchId': r['id'],
                             'meta': m.get(bt[:5]) or {}, 'stocks': rows,
                             'source': r['source'] or '',
+                            'payloadHash': r['payload_hash'] or '',
                             'active': active_ref is not None and r['id'] == active_ref,
                             'cash': bool(rows) and all(x['isCash'] for x in rows),
                             'from': 'db'})
@@ -217,12 +221,18 @@ async def recommend_batches_api(date: str = ''):
             g.append({k: r[k] for k in ('symbol', 'name', 'rank', 'score',
                                         'timing', 'mode', 'price', 'change_percent')})
         return [{'batch': b, 'batchTime': b, 'batchId': None, 'meta': m.get(b) or {},
-                 'stocks': groups.get(b, []), 'source': '', 'active': False,
-                 'cash': False, 'from': 'snapshot'}
+                 'stocks': groups.get(b, []), 'source': '', 'payloadHash': '',
+                 'active': False, 'cash': False, 'from': 'snapshot'}
                 for b in sorted(set(groups) | set(m))]
     try:
         batches = await asyncio.to_thread(_read)
-        return {'success': True, 'data': {'date': d, 'batches': batches}}
+        # 2026-11-23：写入侧只跟当日最后一批比指纹，非连续重放同内容会多留一行。
+        # "当天到底推了几次"按 payload_hash 去重才不虚高；rawCount 保留原始行数供对账。
+        hashes = [b.get('payloadHash') for b in batches if b.get('payloadHash')]
+        unique_count = len(set(hashes)) if hashes else len(batches)
+        return {'success': True,
+                'data': {'date': d, 'batches': batches,
+                         'rawCount': len(batches), 'uniqueCount': unique_count}}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"读取当日批次失败: {str(error)}")
 
@@ -240,10 +250,12 @@ async def get_recommend_sim_batch_api(months: int = 3, capital: float = 100000, 
                                             auction_max_gap=gap)
 
     try:
-        data, state = _swr.swr_get(_REC_SIM_CACHE, key, _compute,
-                                   ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
-                                   label='rec-sim-batch', gap=120, max_keys=12,
-                                   cacheable=rec_params_cacheable(months, capital, gap))
+        raw, state = await _swr.async_swr_get(
+            _REC_SIM_CACHE, key, lambda: asyncio.to_thread(_compute),
+            ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
+            label='rec-sim-batch', gap=120, max_keys=12,
+            cacheable=rec_params_cacheable(months, capital, gap))
+        data = raw
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"拆档回测计算失败: {str(error)}")
     return {'success': True, 'data': data, 'cached': state != 'cold', 'stale': state == 'stale'}
@@ -268,12 +280,13 @@ async def get_recommend_excess_api(months: int = 6,
     key = (months, slippage_bps)
     from services.pick import rec_sim
     try:
-        data, state = _swr.swr_get(_EXCESS_CACHE, key,
-                                   lambda: rec_sim.open_hold_excess(
-                                       months=months, slippage_bps=slippage_bps),
-                                   ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
-                                   label='rec-excess', gap=120, max_keys=6,
-                                   cacheable=(months == 6 and slippage_bps in (0, 10, 20)))
+        data, state = await _swr.async_swr_get(
+            _EXCESS_CACHE, key,
+            lambda: asyncio.to_thread(rec_sim.open_hold_excess,
+                                      months=months, slippage_bps=slippage_bps),
+            ttl=_REC_SIM_TTL, stale_max=_SWR_STALE_MAX,
+            label='rec-excess', gap=120, max_keys=6,
+            cacheable=(months == 6 and slippage_bps in (0, 10, 20)))
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"可执行超额计算失败: {str(error)}")
     return {'success': True, 'data': data, 'cached': state != 'cold', 'stale': state == 'stale'}

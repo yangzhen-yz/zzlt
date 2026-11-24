@@ -336,22 +336,24 @@ async def _build_daily_recs_payload() -> Dict:
 
     # 性能优化（2026-07-02）：原实现每条历史记录串行 await client.get（最多29次，4-9s）
     # 改为：先收集所有历史 symbols，一次性批量拉取，再回填
-    # Step 1: 标记 isToday + 收集所有历史 symbols
+    # Step 1: 标记 isToday + 收集所有 symbols
+    # 2026-11-23：今日票原实现 continue 不收集，主表被 keep_best 保护后卡片
+    # 价格就冻在那一批的时刻（截图里上午九阳 63 分、收盘看还是那个价）。
+    # 现今日票也进批量行情，Step 3 只回填 currentPrice/currentChangePercent，
+    # **不回填 profitRatio**——今日买入参考价不是真实成交价，算"浮盈 X%"会误导。
     all_history_symbols = []
     for record in daily_recommendations:
         rec_date = record.get('date', '')
-        if rec_date >= today_str:
-            record['isToday'] = True
-            continue
-        record['isToday'] = False
+        record['isToday'] = rec_date >= today_str
         stocks = record.get('daily_recommendations') or record.get('stocks') or []
         for s in stocks:
             sym = s.get('symbol', '')
             if sym:
                 all_history_symbols.append(sym)
 
-    # Step 2: 一次性批量拉取所有历史 symbols 的实时行情
+    # Step 2: 一次性批量拉取所有 symbols 的实时行情
     price_map = {}
+    change_map = {}          # 2026-11-23：现价配套的当日涨跌幅，只用于展示、不参与盈亏
     if all_history_symbols:
         try:
             # 去重
@@ -394,33 +396,48 @@ async def _build_daily_recs_payload() -> Dict:
                             full_sym = prefix + raw_code
                             price_map[full_sym] = cur_price
                             price_map[raw_code] = cur_price
+                            # 腾讯字段 32 = 当日涨跌幅（%），取不到就留空，不编 0
+                            if len(parts) > 32:
+                                try:
+                                    pct = float(parts[32])
+                                    change_map[full_sym] = pct
+                                    change_map[raw_code] = pct
+                                except (ValueError, IndexError):
+                                    pass
         except Exception as _e:
             print(f'[历史推荐] 行情解析失败: {_e}')
 
-    # Step 3: 回填每条记录的 currentPrice + profitRatio
+    # Step 3: 回填每条记录的 currentPrice；历史票另算 profitRatio
     for record in daily_recommendations:
-        if record.get('isToday'):
-            continue
         stocks = record.get('daily_recommendations') or record.get('stocks') or []
         for s in stocks:
             sym = s.get('symbol', '').lower()
             cur = price_map.get(sym, 0)
-            if cur > 0:
-                s['currentPrice'] = cur
-                buy_price = 0
-                bsp = s.get('buySellPoints')
-                if bsp and bsp.get('buy'):
-                    try:
-                        buy_price = float(bsp['buy'])
-                    except (ValueError, TypeError):
-                        pass
-                if buy_price <= 0:
-                    try:
-                        buy_price = float(s.get('price', 0))
-                    except (ValueError, TypeError):
-                        pass
-                if buy_price > 0:
-                    s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
+            if cur <= 0:
+                continue
+            s['currentPrice'] = cur
+            if record.get('isToday'):
+                # 2026-11-23：今日票只补现价＋当日涨跌幅供卡片展示。
+                # 绝不写 profitRatio——今日"买入参考价"不是真实成交价，
+                # 拿它算出来的"盈利 X%"会让人误以为已按那个价买入。
+                pct = change_map.get(sym)
+                if pct is not None:
+                    s['currentChangePercent'] = pct
+                continue
+            buy_price = 0
+            bsp = s.get('buySellPoints')
+            if bsp and bsp.get('buy'):
+                try:
+                    buy_price = float(bsp['buy'])
+                except (ValueError, TypeError):
+                    pass
+            if buy_price <= 0:
+                try:
+                    buy_price = float(s.get('price', 0))
+                except (ValueError, TypeError):
+                    pass
+            if buy_price > 0:
+                s['profitRatio'] = round((cur - buy_price) / buy_price * 100, 2)
 
     return {"success": True, "data": daily_recommendations}
 
@@ -931,6 +948,51 @@ def _get_eastmoney_session() -> _req.Session:
         _eastmoney_session.mount('http://', adapter)
     return _eastmoney_session
 
+
+
+# ========== 手动触发的后台任务管理（2026-11-23）==========
+# 5 处手动刷新 API（rps/fundamental/valuation/kline-sync/kline-backfill）原先裸
+# `asyncio.create_task(_bg())`：无强引用、可重复点击叠跑、重启后任务丢了也没痕迹。
+# 这里统一托管：按 key 去重（同 key 正在跑就拒绝，返回 False）、持强引用防 GC、
+# 记录开始/结束/结果供 /api/background-tasks 查看。不改变重活的执行位置
+# （搬出主进程属架构改动，另做），只治"叠跑与失联"。
+_BG_TASKS: Dict[str, Dict] = {}
+
+
+def spawn_tracked(key: str, coro_factory) -> bool:
+    """派发一个受管的后台协程；同 key 已在跑则返回 False（不叠跑）。"""
+    import asyncio as _aio
+
+    old = _BG_TASKS.get(key)
+    if old and not old['task'].done():
+        print(f'[后台任务] {key} 已在运行（{old["started"]}），本次忽略重复触发')
+        return False
+
+    async def _runner():
+        rec = _BG_TASKS.get(key) or {}
+        try:
+            await coro_factory()
+            rec['status'] = 'done'
+            rec['error'] = ''
+        except Exception as e:
+            rec['status'] = 'failed'
+            rec['error'] = f'{type(e).__name__}: {e}'[:300]
+            print(f'[后台任务] {key} 失败: {rec["error"]}')
+        finally:
+            rec['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
+
+    task = _aio.create_task(_runner())
+    _BG_TASKS[key] = {'task': task, 'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+                      'finished': '', 'status': 'running', 'error': ''}
+    return True
+
+
+def background_tasks_status() -> Dict:
+    """供 /api/background-tasks 查；只回纯数据，不暴露 task 对象。"""
+    return {'success': True, 'data': [
+        {'key': k, 'started': v['started'], 'finished': v['finished'],
+         'status': v['status'] if v['task'].done() else 'running', 'error': v['error']}
+        for k, v in sorted(_BG_TASKS.items())]}
 
 
 # ========== 自动优化引擎 API（V4.4）==========

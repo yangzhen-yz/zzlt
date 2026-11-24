@@ -342,7 +342,8 @@ def exit_sim_rates(max_age: float = 600.0) -> Dict:
 
     2026-11-11 方向 1：卡片默认出口收敛到次日开盘卖。数字不写死——写死的实测数
     会过期（exec_rates 头部那条教训），这里读 rec_sim_daily 最新 run_date 的
-    filled_open / filled_close 两行（低吸真正成交口径，与卡片 execHint 同一锚点）。
+    tailclose_open / tailclose_close 两行（唯一真实成交口径，与卡片 execHint 同一锚点）。
+    2026-11-24：原用 filled_*（假设排板全成交）已被删除，不再拿假设数写卡片。
     缺表/缺行/读失败一律返回 {}，调用方退回纯定性文案，绝不出现 "None%"。
     只读本地库、零外部请求；10 分钟缓存与 exec_rates 同节奏。
     """
@@ -358,7 +359,7 @@ def exit_sim_rates(max_age: float = 600.0) -> Dict:
             rows = conn.execute(
                 "SELECT key, avg_equal, win_rate, trades, window_since, window_until "
                 "FROM rec_sim_daily WHERE run_date=(SELECT MAX(run_date) FROM rec_sim_daily) "
-                "AND key IN ('filled_open','filled_close')").fetchall()
+                "AND key IN ('tailclose_open','tailclose_close')").fetchall()
         finally:
             conn.close()
         for r in rows:
@@ -373,17 +374,16 @@ def exit_sim_rates(max_age: float = 600.0) -> Dict:
 def _default_exit_note() -> str:
     """非封板票的默认出口提醒（2026-11-11 方向 1，只改提醒层）。
 
-    为什么默认次日开盘卖：可成交模拟六组合里「低吸成交→次日开盘卖」是唯一持续为正
-    的组合，同入场拿到次日收盘显著更差（卖法差是期望差的主来源之一）。封板票有自己的
-    exitNote（子集口径，等出口分叉影子裁决），不走这里。数字活取 exit_sim_rates()，
+    默认次日开盘卖是纪律，不再声称它"持续为正"——2026-11-24 删掉假设成交口径后，
+    唯一真实口径 tailclose_open 的实测可为负。数字活取 exit_sim_rates()，
     取不到就只给纪律不给数——不写会过期的死数字，也不编数。
     """
     head = ('默认出口：次日 9:15-9:25 竞价挂卖、开盘即走，不默认拿到次日收盘。')
     d = exit_sim_rates()
-    o, c = d.get('filled_open') or {}, d.get('filled_close') or {}
+    o, c = d.get('tailclose_open') or {}, d.get('tailclose_close') or {}
     if o.get('avg') is None or o.get('win') is None:
         return head + '同批票「开盘卖 vs 拿到收盘」的对照数字见回测页「每日监控点」。'
-    seg = (f"可成交模拟（{o.get('since')}~{o.get('until')}，低吸成交 {o.get('n')} 笔）："
+    seg = (f"真实成交口径（{o.get('since')}~{o.get('until')}，买进 {o.get('n')} 笔）："
            f"开盘卖 {o['avg']:+.2f}%/笔、胜率 {o['win']}%")
     if c.get('avg') is not None and c.get('win') is not None:
         seg += f"；拿到次日收盘 {c['avg']:+.2f}%/笔、{c['win']}%"

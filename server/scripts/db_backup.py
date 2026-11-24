@@ -108,6 +108,26 @@ def backup_one(src: str, dst: str) -> int:
     return os.path.getsize(dst)
 
 
+def verify_backup(dst: str) -> str:
+    """校验**备份副本**的完整性（2026-11-23）。
+
+    只 check 副本、不 check 源库——源库 ok 不代表备份写对了；副本刚写完、
+    没人并发写，可以安全做只读 quick_check。实测三库合计约 17 秒
+    （日K 13s / 分钟 1.4s / 主库 2.2s），在 03:30 离线窗口可接受。
+    返回 'ok' 或抛异常（由调用方写进 manifest 并告警）。
+    """
+    uri = 'file:{}?mode=ro'.format(dst.replace('\\', '/'))
+    conn = sqlite3.connect(uri, uri=True, timeout=60)
+    try:
+        row = conn.execute('PRAGMA quick_check').fetchone()
+        result = str(row[0]) if row else 'no-result'
+        if result != 'ok':
+            raise RuntimeError(f'备份副本完整性检查失败: {result}')
+        return result
+    finally:
+        conn.close()
+
+
 def _list_backups(server_dir: str = SERVER_DIR):
     root = os.path.join(server_dir, 'analysis_out')
     if not os.path.isdir(root):
@@ -181,30 +201,58 @@ def run_backup(mode: str = 'incremental', server_dir: str = SERVER_DIR,
         'serverDir': os.path.abspath(server_dir),
         'keepDays': keep_days,
         'files': [],
+        'ok': True,                      # 2026-11-23：任一库备份/校验失败即置 False 并告警
+        'error': '',
     }
     print(f'[db_backup {ts}] 模式={mode}，待备份 {len(dbs)} 个库：')
+    failures = []
     for src in dbs:
         rel = os.path.relpath(src, server_dir)
         dst = os.path.join(dest_dir, rel)
         src_size = os.path.getsize(src)
         print(f'  - {rel}  ({src_size/1024/1024:.1f} MB)')
-        if not dry_run:
-            try:
-                backup_one(src, dst)
-                manifest['files'].append({'src': src, 'dst': dst, 'bytes': src_size})
-            except Exception as e:
-                print(f'  ⚠️ 备份失败 {rel}: {type(e).__name__}: {e}')
-                raise
+        if dry_run:
+            continue
+        try:
+            backup_one(src, dst)
+            check = verify_backup(dst)   # 验副本不验源库；失败抛异常
+            manifest['files'].append({'src': src, 'dst': dst, 'bytes': src_size,
+                                      'check': check})
+            # 计划任务把 stdout 重定向到 GBK 日志；U+2713 勾号不可编码，会把
+            # 已成功的备份误记成 failed 并误告警。这里只用 ASCII。
+            print(f'    [OK] 副本 quick_check={check}')
+        except Exception as e:
+            msg = f'{rel}: {type(e).__name__}: {e}'
+            print(f'  [备份失败] {msg}')
+            failures.append(msg)
+            manifest['files'].append({'src': src, 'dst': dst, 'bytes': src_size,
+                                      'check': 'failed', 'error': str(e)[:300]})
+    if failures:
+        manifest['ok'] = False
+        manifest['error'] = '; '.join(failures)[:1000]
     if not dry_run:
         os.makedirs(dest_dir, exist_ok=True)
         with open(os.path.join(dest_dir, 'manifest.json'), 'w', encoding='utf-8') as fh:
             json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        if failures:
+            _alert(f'[数据库备份失败] {ts} 模式={mode}\n' + '\n'.join(failures))
     removed = prune(server_dir, keep_days, dry_run)
     if removed:
         print(f'[db_backup {ts}] 清理 {len(removed)} 个过期/超限备份')
     tag = '演练：' if dry_run else ''
-    print(f'[db_backup {ts}] {tag}完成，落盘 {dest_dir}')
+    print(f'[db_backup {ts}] {tag}完成（ok={manifest["ok"]}），落盘 {dest_dir}')
+    if failures:
+        raise RuntimeError(manifest['error'])   # 非零退出码，scheduler 侧据此再告警
     return manifest
+
+
+def _alert(text: str) -> None:
+    """走非股票服务异常告警的共用每日限频；失败只记日志，绝不影响备份本身。"""
+    try:
+        from services.ops.alert_throttle import push_non_stock_alert
+        push_non_stock_alert(text, source='db_backup')
+    except Exception as e:
+        print(f'[db_backup] 告警推送失败（不影响备份）: {type(e).__name__}: {e}')
 
 
 def main():

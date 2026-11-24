@@ -11,6 +11,7 @@ from datetime import date
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from services.portfolio import exit_rules as _er  # noqa: E402
 from services.portfolio.exit_rules import plan_exit  # noqa: E402
 
 TODAY = date(2026, 11, 8)
@@ -113,10 +114,18 @@ ok = all(not mech(p, mid)['hit'] for mid in ('u1', 'u2', 'u3', 'u4'))
 check('向后兼容：仅必填入参不触发新规则', ok)
 
 # 13) 影子模式：u4 命中 → action 建议为 exit，但 live=False（position.py 据此不越权接管）
-p = plan_exit(symbol='X', cost=10, price=10.3, buy_date='2026-11-06',
-              market_down=True, day_gain_pct=3.0, sector_down=None, today=TODAY)
-check('影子模式：建议exit但live=False不接管',
-      p.get('action') == 'exit' and p.get('hit') == 'u4' and p.get('live') is False)
+# 注意：plan_exit 内部 _live() 读 app_settings 热覆盖表（线上可能已把开关打开成 True），
+# 本自测声称"纯函数无 DB"，就必须把 live 开关钉成 False 再验契约，否则线上改个配置
+# 就会让这条断言假红（11-24 实测：线上 exit_rules_live_enabled=True 导致本条失败）。
+_orig_live = _er._live
+try:
+    _er._live = lambda: False
+    p = plan_exit(symbol='X', cost=10, price=10.3, buy_date='2026-11-06',
+                  market_down=True, day_gain_pct=3.0, sector_down=None, today=TODAY)
+    check('影子模式：建议exit但live=False不接管',
+          p.get('action') == 'exit' and p.get('hit') == 'u4' and p.get('live') is False)
+finally:
+    _er._live = _orig_live
 
 print('\n' + ('ALL PASS' if not fails else f'FAILED: {fails}'))
 sys.exit(1 if fails else 0)

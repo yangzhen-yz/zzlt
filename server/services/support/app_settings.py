@@ -415,9 +415,9 @@ SPEC: List[Dict[str, Any]] = [
     {
         'key': 'rec_sim_daily_enabled', 'cfg': 'REC_SIM_DAILY_ENABLED', 'kind': 'bool',
         'label': '每日跑可成交性监控（16:20）', 'group': '策略快照', 'live': True,
-        'note': '把"同一批推荐在三种入口口径下各值多少钱"每天存一个点（rec_sim_daily）。'
+        'note': '把"同一批推荐在真实成交口径下值多少钱"每天存一个点（rec_sim_daily）。'
                 '关掉后回测曲线页仍能现算当天数字，但失去时间序列——'
-                '任何"放宽过滤/多推/改模式"的提案都要靠这条序列证明 auction 口径没恶化',
+                '任何"放宽过滤/多推/改模式"的提案都要靠这条序列证明真实口径没恶化',
         'impact': None,
     },
     {
